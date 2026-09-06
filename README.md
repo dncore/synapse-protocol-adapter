@@ -124,6 +124,60 @@ How the daemon is hosted is orthogonal to how it routes: the
 `upstream.responses_mode` knob (`convert` vs `passthrough`) and the
 transparent `/v1/*` forwarding behave the same under all three.
 
+## Performance
+
+**Measured, end-to-end** (`tests/load` against a deterministic local
+upstream, i7-14650HX, all three components on one busy dev machine —
+treat as conservative real-world numbers, not lab conditions):
+
+| Path (100 concurrent) | Throughput | p50 | p95 | p99 |
+|---|---|---|---|---|
+| Direct to upstream (no proxy, baseline) | 41,700 req/s | 1.25 ms | 8.1 ms | 12.6 ms |
+| **Convert** (`POST /v1/responses`) | ~35,000 req/s | 2.41 ms | 6.5 ms | 10.2 ms |
+| **Passthrough** (`POST /v1/chat/completions`) | ~35,000 req/s | 2.65 ms | 6.4 ms | 8.6 ms |
+
+- **Proxy tax: ~+1.2 ms p50** for full Responses↔Chat conversion
+  (parse, convert, re-serialize), ~+1.4 ms for byte-forwarding — while
+  sustaining ~35k req/s on a single core-pair. Zero errors across the
+  runs.
+- Concurrency sweep (convert): 28.0k req/s @ 10 workers (p99 0.87 ms),
+  34.8k req/s @ 200 workers (p99 21.8 ms) — no collapse, latency scales
+  gently.
+- **Streaming** (100 concurrent streams, 204-chunk responses):
+  3,580 streams/s ≈ **730k converted SSE events/s**; first-event latency
+  p50 17.9 ms / p95 46.8 ms (includes the local upstream's own 200
+  sequential chunks; against a real LLM, provider time-to-first-token
+  dominates and the proxy adds ~1 ms).
+- **Footprint**: RSS 11 MB idle → ~26–46 MB under sustained load,
+  stable (no growth across runs); single static binary, no runtime deps.
+
+Conversion-layer micro-benchmarks (`make bench`) — where the nanoseconds
+go:
+
+```
+BenchmarkConvertRequest-16     2612932    897.9 ns/op
+BenchmarkConvertResponse-16   11060269    210.9 ns/op
+BenchmarkStreamer-16             82387  29467 ns/op   # ~203-chunk stream ≈ 145 ns/chunk
+```
+
+Reproduce with:
+
+```bash
+make bench                                                   # micro
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses \
+    -concurrency 100 -duration 30s                           # e2e
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses \
+    -concurrency 100 -duration 30s -stream                   # first-byte percentiles
+```
+
+In production the LLM provider is the bottleneck by 2–4 orders of
+magnitude; the proxy layer stays out of the way.
+
+Runtime observability is built in: `/metrics` exposes request, upstream,
+and first-byte latency histograms (p50/p95/p99 derivable) plus gauges
+for active connections/requests — so you can capture the same numbers
+against your real provider at any time.
+
 ## Protocol conversion semantics
 
 | Endpoint | Description |
@@ -462,29 +516,7 @@ Logging is structured JSON (slog): `timestamp`, `level`, `request_id`,
 logs `Authorization` headers, API keys, prompts, or bodies — there is no
 code path that could.
 
-## Performance
-
-Conversion-layer micro-benchmarks (`make bench`, i7-14650HX):
-
-```
-BenchmarkConvertRequest-16     2612932    897.9 ns/op
-BenchmarkConvertResponse-16   11060269    210.9 ns/op
-BenchmarkStreamer-16             82387  29467 ns/op   # ~203-chunk stream ≈ 145 ns/chunk
-```
-
-The adapter adds well under a millisecond of CPU per request and ~150 ns
-per streamed chunk — the proxy layer is not the bottleneck at 100+
-concurrent streams.
-
-Load test against a running instance:
-
-```bash
-go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s
-go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s -stream
-```
-
-Reports req/s, errors, throughput, latency p50/p95/p99, and — in streaming
-mode — first-SSE-event latency percentiles.
+## Testing
 
 ```bash
 make test    # unit + e2e suite

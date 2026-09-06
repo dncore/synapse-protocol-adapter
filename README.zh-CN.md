@@ -116,6 +116,54 @@ docker run --rm -p 8787:8787 \
 托管方式与路由方式正交：`upstream.responses_mode`（`convert` 与
 `passthrough`）和 `/v1/*` 透明转发在三种方式下行为相同。
 
+## 性能
+
+**实测端到端数据**（`tests/load` 对本地确定性 upstream，i7-14650HX，
+三个组件同机且机器有其他负载——视为保守的真实环境值，非实验室条件）：
+
+| 路径（100 并发） | 吞吐 | p50 | p95 | p99 |
+|---|---|---|---|---|
+| 直连 upstream（无代理，基线） | 41,700 req/s | 1.25 ms | 8.1 ms | 12.6 ms |
+| **转换**（`POST /v1/responses`） | ~35,000 req/s | 2.41 ms | 6.5 ms | 10.2 ms |
+| **透传**（`POST /v1/chat/completions`） | ~35,000 req/s | 2.65 ms | 6.4 ms | 8.6 ms |
+
+- **代理税：p50 约 +1.2 ms**（完整 Responses↔Chat 转换：解析、转换、
+  重组序列化），字节级透传约 +1.4 ms——单核对上即可支撑 ~3.5 万 req/s，
+  全程零错误
+- 并发扫描（转换路径）：10 并发 28.0k req/s（p99 0.87 ms）、
+  200 并发 34.8k req/s（p99 21.8 ms）——无塌陷，延迟缓升
+- **流式**（100 并发流、每流 204 chunk）：3,580 流/s ≈
+  **每秒 73 万次 SSE 事件转换**；首事件延迟 p50 17.9 ms / p95 46.8 ms
+  （含本地 upstream 自身 200 个串行 chunk；对接真实 LLM 时，
+  provider 的首 token 时间占绝对主导，代理只加 ~1 ms）
+- **资源占用**：空闲 RSS 11 MB → 持续负载下 26–46 MB，稳定无增长；
+  单静态二进制，零运行时依赖
+
+转换层微基准（`make bench`）——纳秒花在哪：
+
+```
+BenchmarkConvertRequest-16     2612932    897.9 ns/op
+BenchmarkConvertResponse-16   11060269    210.9 ns/op
+BenchmarkStreamer-16             82387  29467 ns/op   # ~203-chunk 流 ≈ 145 ns/chunk
+```
+
+复现方式：
+
+```bash
+make bench                                                   # 微基准
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses \
+    -concurrency 100 -duration 30s                           # 端到端
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses \
+    -concurrency 100 -duration 30s -stream                   # 首字节分位数
+```
+
+生产环境中 LLM provider 才是瓶颈（差 2–4 个数量级）；代理层保持在
+视线之外。
+
+运行时可观测性内建：`/metrics` 暴露请求、upstream、首字节延迟直方图
+（可导出 p50/p95/p99）与活跃连接/请求 gauge——随时可对你的真实
+provider 复测同样指标。
+
 ## 协议转换语义
 
 | 端点 | 说明 |
@@ -451,28 +499,7 @@ curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
 `Authorization` header、API Key、prompt 或 body——代码里根本不存在这样
 的路径。
 
-## 性能
-
-转换层微基准（`make bench`，i7-14650HX）：
-
-```
-BenchmarkConvertRequest-16     2612932    897.9 ns/op
-BenchmarkConvertResponse-16   11060269    210.9 ns/op
-BenchmarkStreamer-16             82387  29467 ns/op   # 约 203-chunk 的流 ≈ 145 ns/chunk
-```
-
-单请求 CPU 开销远低于 1 毫秒、每流式 chunk 约 150 ns——100+ 并发流下
-代理层不构成瓶颈。
-
-对运行中的实例压测：
-
-```bash
-go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s
-go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s -stream
-```
-
-输出 req/s、错误数、吞吐、延迟 p50/p95/p99，流式模式下另有首个 SSE
-事件延迟分位数。
+## 测试
 
 ```bash
 make test    # 单元 + e2e 测试
