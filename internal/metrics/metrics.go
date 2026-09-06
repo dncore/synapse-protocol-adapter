@@ -16,24 +16,25 @@ import (
 // Registry holds all metrics of the proxy.
 type Registry struct {
 	// Counters (monotonic).
-	RequestsTotal        *Counter
-	ResponsesTotal       *Counter
-	ErrorsTotal          *LabeledCounter
-	UpstreamErrorsTotal  *LabeledCounter
-	StreamingRequests    *Counter
-	ToolCallsTotal       *Counter
-	BytesInTotal         *Counter
-	BytesOutTotal        *Counter
-	UpstreamConnections  *Counter
+	RequestsTotal            *Counter
+	ResponsesTotal           *Counter
+	PassthroughRequestsTotal *Counter
+	ErrorsTotal              *LabeledCounter
+	UpstreamErrorsTotal      *LabeledCounter
+	StreamingRequests        *Counter
+	ToolCallsTotal           *Counter
+	BytesInTotal             *Counter
+	BytesOutTotal            *Counter
+	UpstreamConnections      *Counter
 
 	// Gauges.
 	ActiveConnections *Gauge
 	ActiveRequests    *Gauge
 
 	// Histograms (seconds).
-	RequestDuration    *Histogram
-	UpstreamDuration   *Histogram
-	FirstByteLatency   *Histogram
+	RequestDuration  *Histogram
+	UpstreamDuration *Histogram
+	FirstByteLatency *Histogram
 }
 
 var defaultBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300}
@@ -41,15 +42,16 @@ var defaultBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 
 // NewRegistry constructs the proxy's metric set.
 func NewRegistry() *Registry {
 	return &Registry{
-		RequestsTotal:       &Counter{Name: "protocol_proxy_requests_total", Help: "Total requests received on proxy endpoints."},
-		ResponsesTotal:      &Counter{Name: "protocol_proxy_responses_total", Help: "Total responses sent to clients (non-error)."},
-		ErrorsTotal:         &LabeledCounter{Name: "protocol_proxy_errors_total", Help: "Total errors by type.", Label: "type"},
-		UpstreamErrorsTotal: &LabeledCounter{Name: "protocol_proxy_upstream_errors_total", Help: "Total upstream request failures by class.", Label: "class"},
-		StreamingRequests:   &Counter{Name: "protocol_proxy_streaming_requests_total", Help: "Total streaming (SSE) responses started."},
-		ToolCallsTotal:      &Counter{Name: "protocol_proxy_tool_calls_total", Help: "Total tool calls observed in upstream output."},
-		BytesInTotal:        &Counter{Name: "protocol_proxy_bytes_in_total", Help: "Bytes received from clients (request bodies)."},
-		BytesOutTotal:       &Counter{Name: "protocol_proxy_bytes_out_total", Help: "Bytes sent to clients (response bodies)."},
-		UpstreamConnections: &Counter{Name: "protocol_proxy_upstream_requests_total", Help: "Total requests issued to upstream."},
+		RequestsTotal:            &Counter{Name: "protocol_proxy_requests_total", Help: "Total requests received on proxy endpoints."},
+		ResponsesTotal:           &Counter{Name: "protocol_proxy_responses_total", Help: "Total responses sent to clients (non-error)."},
+		PassthroughRequestsTotal: &Counter{Name: "protocol_proxy_passthrough_requests_total", Help: "Total requests transparently forwarded to upstream without protocol conversion."},
+		ErrorsTotal:              &LabeledCounter{Name: "protocol_proxy_errors_total", Help: "Total errors by type.", Label: "type"},
+		UpstreamErrorsTotal:      &LabeledCounter{Name: "protocol_proxy_upstream_errors_total", Help: "Total upstream request failures by class.", Label: "class"},
+		StreamingRequests:        &Counter{Name: "protocol_proxy_streaming_requests_total", Help: "Total streaming (SSE) responses started."},
+		ToolCallsTotal:           &Counter{Name: "protocol_proxy_tool_calls_total", Help: "Total tool calls observed in upstream output."},
+		BytesInTotal:             &Counter{Name: "protocol_proxy_bytes_in_total", Help: "Bytes received from clients (request bodies)."},
+		BytesOutTotal:            &Counter{Name: "protocol_proxy_bytes_out_total", Help: "Bytes sent to clients (response bodies)."},
+		UpstreamConnections:      &Counter{Name: "protocol_proxy_upstream_requests_total", Help: "Total requests issued to upstream."},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -126,8 +128,8 @@ func (g *Gauge) Value() int64 { return g.v.Load() }
 
 // Histogram counts observations into fixed upper-bound buckets.
 type Histogram struct {
-	Name    string
-	Help    string
+	Name   string
+	Help   string
 	bounds []float64
 	counts []atomic.Int64
 	sumN   atomic.Int64 // observation count
@@ -166,6 +168,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 
 	writeCounter(r.RequestsTotal, "")
 	writeCounter(r.ResponsesTotal, "")
+	writeCounter(r.PassthroughRequestsTotal, "")
 	writeCounter(r.StreamingRequests, "")
 	writeCounter(r.ToolCallsTotal, "")
 	writeCounter(r.BytesInTotal, "")

@@ -62,6 +62,11 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
+	// Everything else under /v1/ transparently forwards to the upstream
+	// (same method/path/query, streamed both ways): /v1/chat/completions,
+	// /v1/models, ... The more specific /v1/responses pattern wins for the
+	// converted route.
+	mux.HandleFunc("/v1/", s.handlePassthrough)
 
 	// Middleware order (outermost first): RequestID assigns the ID so every
 	// inner layer (including logs and panics) can reference it; AccessLog
@@ -188,6 +193,19 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // --- the proxy endpoint ---
 
+// acquireSlot bounds concurrency with a semaphore; blocking acquire
+// applies backpressure and honors client cancellation while queued. It
+// returns nil when the client went away before a slot freed up.
+func (s *Server) acquireSlot(r *http.Request) func() {
+	select {
+	case s.sem <- struct{}{}:
+		return func() { <-s.sem }
+	case <-r.Context().Done():
+		s.metrics.ErrorsTotal.With("client_canceled").Inc()
+		return nil
+	}
+}
+
 // handleResponses is the whole protocol conversion pipeline.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -195,15 +213,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ActiveRequests.Inc()
 	defer s.metrics.ActiveRequests.Dec()
 
-	// Bound concurrency: blocking acquire applies backpressure and honors
-	// client cancellation while queued.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-r.Context().Done():
-		s.metrics.ErrorsTotal.With("client_canceled").Inc()
-		return
+	release := s.acquireSlot(r)
+	if release == nil {
+		return // client went away while queued
 	}
+	defer release()
 
 	body, err := upstream.ReadAllWithLimit(r.Body, int64(s.cfg.Limits.MaxBodyBytes))
 	if err != nil {
@@ -311,7 +325,6 @@ func (s *Server) encodedResponse(w http.ResponseWriter, resp *http.Response, req
 // to the provider without buffering.
 func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx context.Context, cancel context.CancelFunc, resp *http.Response, req *responses.Request, start time.Time) {
 	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Now().Add(s.cfg.Timeouts.StreamWrite))
 	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
 
 	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
@@ -324,6 +337,10 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 	firstByte := true
 
 	writeEvent := func(ev *responses.Event) bool {
+		// Per-write deadline: stream_write bounds client stall time, not
+		// total stream duration — a healthy 30-minute generation must not
+		// trip it.
+		_ = rc.SetWriteDeadline(time.Now().Add(s.cfg.Timeouts.StreamWrite))
 		if err := sw.WriteEvent(ev.Type, ev); err != nil {
 			// Client vanished or write deadline hit: abort upstream now.
 			cancel()

@@ -107,11 +107,29 @@ docker run --rm -p 8787:8787 \
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/responses` | 完整转换，流式与非流式 |
+| `ANY /v1/*`（除 `/v1/responses`） | **透明转发**到 upstream——同方法/路径/query，请求 body 不解析不缓冲，响应逐字节回传（见下） |
 | `GET /health` | 存活——进程运行即 200 |
 | `GET /ready` | 就绪——shutdown 开始即 503 |
 | `GET /metrics` | Prometheus 文本格式 |
 | `GET /version` | 构建版本 |
 | `GET /` | 端点列表 |
+
+### 透明转发（`/v1/chat/completions`、`/v1/models` 等）
+
+`/v1/` 下除 `/v1/responses` 外的一切原样转发到已配置的 upstream：剥掉
+`/v1` 前缀，路径、query、方法、header（同一套过滤规则）透传，请求
+body **从不解析、从不缓冲**，响应——包括错误状态码与错误体——逐字节
+流式回传，每读必 flush。
+
+一个端口同时说两种协议：Responses 客户端走 `/v1/responses`（转换），
+原生 chat-completions 客户端走 `/v1/chat/completions`（原样转发），
+Codex 的模型选择器也能从 `/v1/models` 拿到真实结果。它可以取代本地
+的 `socat`/TCP 转发——且多了连接复用、客户端断开取消、背压和
+metrics 这些 socat 没有的能力。
+
+范围说明：这是对**单一已配置 upstream** 的限定反向代理，不是开放代
+理——`/v1/*` 只能到达该 provider，到不了任何其他主机。仅转发 HTTP
+（不支持 WebSocket 升级）。
 
 ### 请求映射（Responses → Chat Completions）
 
@@ -404,6 +422,7 @@ curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
 | `protocol_proxy_errors_total{type}` | counter | 代理侧错误 |
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream 失败 |
 | `protocol_proxy_streaming_requests_total` | counter | 开始的 SSE 流 |
+| `protocol_proxy_passthrough_requests_total` | counter | 透明转发的请求（无转换） |
 | `protocol_proxy_tool_calls_total` | counter | 输出中观察到的 tool call |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | 出入 body 字节 |
 | `protocol_proxy_upstream_requests_total` | counter | 发起的 upstream 调用 |

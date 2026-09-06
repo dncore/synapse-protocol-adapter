@@ -113,11 +113,31 @@ Then point any Responses-API client at `http://<host>:8787/v1`.
 | Endpoint | Description |
 |---|---|
 | `POST /v1/responses` | Full conversion, streaming and non-streaming |
+| `ANY /v1/*` (except `/v1/responses`) | **Transparent forward** to the upstream — same method/path/query, body streamed unmodified, response streamed byte-for-byte (see below) |
 | `GET /health` | Liveness — 200 while the process is up |
 | `GET /ready` | Readiness — 503 once shutdown begins |
 | `GET /metrics` | Prometheus text format |
 | `GET /version` | Build version |
 | `GET /` | Endpoint listing |
+
+### Transparent passthrough (`/v1/chat/completions`, `/v1/models`, …)
+
+Everything under `/v1/` except `/v1/responses` is forwarded verbatim to the
+configured upstream: the `/v1` prefix is stripped, the path, query, method,
+and headers (per the same filtering rules) go through, the request body is
+**never parsed or buffered**, and the response — including error statuses
+and bodies — is streamed back byte-for-byte with a flush per read.
+
+This means one port speaks both protocols: Responses clients hit
+`/v1/responses` (converted), native chat-completions clients hit
+`/v1/chat/completions` (forwarded as-is), and Codex's model picker gets a
+real answer from `/v1/models`. It replaces a local `socat`/TCP forwarder
+for this upstream — with connection pooling, client-disconnect
+cancellation, backpressure, and metrics that socat does not provide.
+
+Scope note: this is a scoped reverse proxy for the **single configured
+upstream**, not an open proxy — `/v1/*` reaches that provider and nothing
+else. Only HTTP is forwarded (no WebSocket upgrades).
 
 ### Request mapping (Responses → Chat Completions)
 
@@ -411,6 +431,7 @@ Metrics (all low-cardinality; never any header, credential, or prompt data):
 | `protocol_proxy_errors_total{type}` | counter | proxy-side errors |
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream failures |
 | `protocol_proxy_streaming_requests_total` | counter | SSE streams started |
+| `protocol_proxy_passthrough_requests_total` | counter | requests transparently forwarded (no conversion) |
 | `protocol_proxy_tool_calls_total` | counter | tool calls observed in output |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | body bytes in/out |
 | `protocol_proxy_upstream_requests_total` | counter | upstream calls issued |

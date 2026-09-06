@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
@@ -43,7 +44,8 @@ var mustRecompute = map[string]struct{}{
 // Client is the upstream HTTP client. It is safe for concurrent use.
 type Client struct {
 	http *http.Client
-	url  string
+	url  string // converted-route endpoint (base + configured path)
+	base string // base_url without trailing slash, for passthrough routing
 	cfg  config.Config
 }
 
@@ -73,8 +75,27 @@ func NewClient(cfg config.Config) *Client {
 	return &Client{
 		http: &http.Client{Transport: tr},
 		url:  cfg.Upstream.URL(),
+		base: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
 		cfg:  cfg,
 	}
+}
+
+// DoPassthrough issues an arbitrary request to the configured upstream,
+// targeting base_url + path with the client's headers attached. It is the
+// transparent-forwarding counterpart of Do: no body transformation, no
+// endpoint assumptions. path is the request path below /v1 (e.g.
+// "/chat/completions"); rawQuery is forwarded verbatim.
+func (c *Client) DoPassthrough(ctx context.Context, method, path, rawQuery string, body io.Reader, clientHeaders http.Header) (*http.Response, error) {
+	u := c.base + path
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, fmt.Errorf("build upstream request: %w", err)
+	}
+	ForwardRequestHeaders(req.Header, clientHeaders)
+	return c.http.Do(req)
 }
 
 // ForwardRequestHeaders copies the client's headers onto the upstream
