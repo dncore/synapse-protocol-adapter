@@ -1,6 +1,7 @@
 # local artifacts
 synapse
-synapse-protocol-adapter
+synapse-darwin-*
+protocol-proxy
 *.log
 config.local.yaml
 
