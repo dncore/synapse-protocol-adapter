@@ -413,6 +413,15 @@ func (s *Server) forwardUpstreamError(w http.ResponseWriter, resp *http.Response
 		msg = parsed.Error.Message
 	}
 	if msg == "" {
+		// FastAPI-style error envelope: {"detail":"..."}.
+		var detail struct {
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(body, &detail); err == nil && detail.Detail != "" {
+			msg = detail.Detail
+		}
+	}
+	if msg == "" {
 		msg = strings.TrimSpace(string(body))
 	}
 	if msg == "" {
