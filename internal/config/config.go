@@ -38,6 +38,13 @@ type Upstream struct {
 	BaseURL string `yaml:"base_url"`
 	// Path is appended to BaseURL; defaults to /chat/completions.
 	Path string `yaml:"path"`
+	// ResponsesMode selects how POST /v1/responses is served:
+	//   convert     (default) translate to chat completions upstream
+	//   passthrough forward to the upstream's native /responses endpoint
+	// Set passthrough when the provider already implements the Responses
+	// API well; the proxy then adds only transport value (pooling,
+	// cancellation, one endpoint) with zero semantic translation.
+	ResponsesMode string `yaml:"responses_mode"`
 }
 
 // URL returns the absolute completions endpoint.
@@ -80,7 +87,7 @@ type Log struct {
 func Defaults() Config {
 	return Config{
 		Server:   Server{Listen: "0.0.0.0:8787"},
-		Upstream: Upstream{BaseURL: "http://127.0.0.1:8000/v1"},
+		Upstream: Upstream{BaseURL: "http://127.0.0.1:8000/v1", ResponsesMode: "convert"},
 		Limits: Limits{
 			MaxConcurrency: 200,
 			MaxBodyBytes:   64 << 20, // 64 MiB: conversation histories can be large
@@ -130,6 +137,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("PROXY_UPSTREAM_PATH"); v != "" {
 		cfg.Upstream.Path = v
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RESPONSES_MODE"); v != "" {
+		cfg.Upstream.ResponsesMode = v
 	}
 	if v := os.Getenv("PROXY_LIMITS_MAX_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -188,6 +198,14 @@ func Validate(cfg *Config) error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			errs = append(errs, fmt.Errorf("upstream.base_url %q is not a valid http(s) URL", cfg.Upstream.BaseURL))
 		}
+	}
+	if cfg.Upstream.ResponsesMode == "" {
+		cfg.Upstream.ResponsesMode = "convert"
+	}
+	switch cfg.Upstream.ResponsesMode {
+	case "convert", "passthrough":
+	default:
+		errs = append(errs, fmt.Errorf("upstream.responses_mode must be \"convert\" or \"passthrough\", got %q", cfg.Upstream.ResponsesMode))
 	}
 	if cfg.Limits.MaxConcurrency <= 0 {
 		errs = append(errs, errors.New("limits.max_concurrency must be > 0"))

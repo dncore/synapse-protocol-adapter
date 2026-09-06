@@ -4,13 +4,19 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 )
+
+func newTestLogger() *slog.Logger        { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+func newTestRegistry() *metrics.Registry { return metrics.NewRegistry() }
 
 func newPassthroughTestServer(t *testing.T, upstreamHandler http.Handler) (*httptest.Server, *httptest.Server) {
 	t.Helper()
@@ -228,6 +234,73 @@ func TestMetrics_PassthroughCounter(t *testing.T) {
 	m.Body.Close()
 	if !strings.Contains(string(body), "protocol_proxy_passthrough_requests_total 2") {
 		t.Fatalf("passthrough counter missing or wrong:\n%s", string(body)[:min(400, len(body))])
+	}
+}
+
+func TestResponsesMode_Passthrough(t *testing.T) {
+	// In passthrough mode POST /v1/responses must reach the upstream's
+	// native /responses endpoint unconverted.
+	var gotPath string
+	var gotBody string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{"object":"response","id":"resp_native"}`))
+	}))
+	defer up.Close()
+
+	cfg := testConfig(up.URL)
+	cfg.Upstream.ResponsesMode = "passthrough"
+	logger := newTestLogger()
+	s := New(cfg, logger, newTestRegistry())
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	body := `{"model":"m","input":"hi","stream":false}`
+	resp, err := http.Post(proxy.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+
+	if gotPath != "/responses" {
+		t.Fatalf("upstream saw %s, want native /responses", gotPath)
+	}
+	if gotBody != body {
+		t.Fatalf("request body must be forwarded unconverted:\n got %s\nwant %s", gotBody, body)
+	}
+	if string(got) != `{"object":"response","id":"resp_native"}` {
+		t.Fatalf("native response must pass through unconverted: %s", got)
+	}
+}
+
+func TestResponsesMode_ConvertDefault(t *testing.T) {
+	// Default mode converts: upstream receives chat completions, not /responses.
+	var gotPath string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/responses", "application/json",
+		strings.NewReader(`{"model":"m","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if gotPath != "/chat/completions" {
+		t.Fatalf("convert mode must hit /chat/completions, saw %s", gotPath)
 	}
 }
 

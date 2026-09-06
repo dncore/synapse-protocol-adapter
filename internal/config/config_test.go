@@ -99,6 +99,7 @@ func TestValidate_Errors(t *testing.T) {
 		{"zero concurrency", func(c *Config) { c.Limits.MaxConcurrency = 0 }, "max_concurrency"},
 		{"zero connect", func(c *Config) { c.Timeouts.Connect = 0 }, "timeouts.connect"},
 		{"bad log format", func(c *Config) { c.Log.Format = "syslog" }, "log.format"},
+		{"bad responses_mode", func(c *Config) { c.Upstream.ResponsesMode = "both" }, "responses_mode"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,6 +110,36 @@ func TestValidate_Errors(t *testing.T) {
 				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+func TestLoad_ResponsesModeNormalizationAndEnv(t *testing.T) {
+	// Empty normalizes to convert.
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Upstream.ResponsesMode != "convert" {
+		t.Fatalf("empty mode must normalize to convert, got %q", cfg.Upstream.ResponsesMode)
+	}
+
+	// YAML value survives; env overrides it.
+	path := writeTemp(t, "upstream:\n  base_url: http://x:1/v1\n  responses_mode: passthrough\n")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Upstream.ResponsesMode != "passthrough" {
+		t.Fatalf("yaml mode lost: %q", cfg.Upstream.ResponsesMode)
+	}
+
+	t.Setenv("PROXY_UPSTREAM_RESPONSES_MODE", "convert")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Upstream.ResponsesMode != "convert" {
+		t.Fatalf("env override failed: %q", cfg.Upstream.ResponsesMode)
 	}
 }
 

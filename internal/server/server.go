@@ -61,7 +61,11 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
-	mux.HandleFunc("POST /v1/responses", s.handleResponses)
+	// In passthrough mode the upstream's native /responses endpoint wins:
+	// the /v1/ catch-all forwards it untouched instead of converting.
+	if cfg.Upstream.ResponsesMode != "passthrough" {
+		mux.HandleFunc("POST /v1/responses", s.handleResponses)
+	}
 	// Everything else under /v1/ transparently forwards to the upstream
 	// (same method/path/query, streamed both ways): /v1/chat/completions,
 	// /v1/models, ... The more specific /v1/responses pattern wins for the
