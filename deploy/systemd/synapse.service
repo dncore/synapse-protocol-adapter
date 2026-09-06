@@ -1,12 +1,12 @@
-# protocol-proxy systemd unit.
+# synapse systemd unit.
 #
 # Install:
-#   sudo cp deploy/systemd/protocol-proxy.service /etc/systemd/system/
+#   sudo cp deploy/systemd/synapse.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now protocol-proxy
+#   sudo systemctl enable --now synapse
 #
-# The binary is expected at /usr/local/bin/protocol-proxy and the config
-# at /etc/protocol-proxy/config.yaml (see ExecStart; adjust to taste).
+# The binary is expected at /usr/local/bin/synapse and the config
+# at /etc/synapse/config.yaml (see ExecStart; adjust to taste).
 
 [Unit]
 Description=Responses -> Completions protocol proxy (synapse-protocol-adapter)
@@ -16,8 +16,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=protocol-proxy
-Group=protocol-proxy
+User=synapse
+Group=synapse
 # Hardening: no new privileges, isolated temp/home.
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -25,7 +25,7 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=
 
-ExecStart=/usr/local/bin/protocol-proxy --config /etc/protocol-proxy/config.yaml
+ExecStart=/usr/local/bin/synapse --config /etc/synapse/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 
 # graceful shutdown: SIGTERM drains in-flight streams up to
@@ -37,7 +37,7 @@ TimeoutStopSec=35s
 Restart=on-failure
 RestartSec=2s
 
-# Logs go to journald (structured JSON lines; view with journalctl -u protocol-proxy).
+# Logs go to journald (structured JSON lines; view with journalctl -u synapse).
 StandardOutput=journal
 StandardError=journal
 

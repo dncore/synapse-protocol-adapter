@@ -1,4 +1,4 @@
-// Command protocol-proxy is a stateless, high-performance protocol adapter
+// Command synapse is a stateless, high-performance protocol adapter
 // exposing the OpenAI Responses API on the client side and the OpenAI Chat
 // Completions API on the upstream side. It forwards client Authorization
 // headers verbatim and manages no credentials, sessions, or accounts.
@@ -41,14 +41,14 @@ func main() {
 		return
 	}
 
-	fs := flag.NewFlagSet("protocol-proxy", flag.ContinueOnError)
+	fs := flag.NewFlagSet("synapse", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to YAML config file (environment variables override)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
 	if *showVersion {
-		fmt.Println("protocol-proxy " + version)
+		fmt.Println("synapse " + version)
 		return
 	}
 

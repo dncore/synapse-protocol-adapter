@@ -1,5 +1,5 @@
 # local artifacts
-protocol-proxy
+synapse
 synapse-protocol-adapter
 *.log
 config.local.yaml

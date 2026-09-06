@@ -185,7 +185,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "protocol-proxy",
+		"service": "synapse",
 		"version": Version,
 		"endpoints": []string{
 			"POST /v1/responses",

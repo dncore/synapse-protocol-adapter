@@ -3,27 +3,27 @@
      systemd unit). Install as a per-user LaunchAgent:
 
        mkdir -p ~/Library/LaunchAgents
-       cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+       cp deploy/launchd/com.synapse.proxy.plist ~/Library/LaunchAgents/
        # adjust the binary/config paths below to your install locations
-       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.proxy.plist
 
      Manage:
-       launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # restart (SIGTERM drain)
-       launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # stop & unload
-       tail -f /tmp/protocol-proxy.log
+       launchctl kickstart -k gui/$(id -u)/com.synapse.proxy   # restart (SIGTERM drain)
+       launchctl bootout      gui/$(id -u)/com.synapse.proxy   # stop & unload
+       tail -f /tmp/synapse.log
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.synapse.protocol-proxy</string>
+    <string>com.synapse.proxy</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/protocol-proxy</string>
+        <string>/usr/local/bin/synapse</string>
         <string>--config</string>
-        <string>/usr/local/etc/protocol-proxy/config.yaml</string>
+        <string>/usr/local/etc/synapse/config.yaml</string>
     </array>
 
     <!-- Start at login; restart if the process exits or crashes. -->
@@ -36,9 +36,9 @@
     <string>Background</string>
 
     <key>StandardOutPath</key>
-    <string>/tmp/protocol-proxy.log</string>
+    <string>/tmp/synapse.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/protocol-proxy.log</string>
+    <string>/tmp/synapse.log</string>
 
     <!-- Optional: bypass a system HTTP proxy for internal upstreams.
          Adjust or remove to match your network. -->

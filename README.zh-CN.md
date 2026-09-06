@@ -88,16 +88,16 @@ upstream SSE ──▶ 逐行增量解析 ──────▶ converter.Stream
 git clone https://github.com/dncore/synapse-protocol-adapter
 cd synapse-protocol-adapter
 make build
-PROXY_UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1" ./protocol-proxy
+PROXY_UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1" ./synapse
 ```
 
 Docker：
 
 ```bash
-docker build -t protocol-proxy .
+docker build -t synapse .
 docker run --rm -p 8787:8787 \
   -e PROXY_UPSTREAM_BASE_URL="http://host.docker.internal:8000/v1" \
-  protocol-proxy
+  synapse
 ```
 
 随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`。
@@ -109,10 +109,10 @@ docker run --rm -p 8787:8787 \
 
 | 方式 | 启动 | 适用 |
 |---|---|---|
-| **裸进程** | `./protocol-proxy --config config.yaml` | 开发调试、快速实验 |
-| **systemd 服务** | `systemctl enable --now protocol-proxy` | Linux 服务器常驻（自动重启、journald 日志、优雅退出） |
+| **裸进程** | `./synapse --config config.yaml` | 开发调试、快速实验 |
+| **systemd 服务** | `systemctl enable --now synapse` | Linux 服务器常驻（自动重启、journald 日志、优雅退出） |
 | **launchd 代理** | `launchctl bootstrap gui/$(id -u) …` | macOS 主机；见 [macOS（launchd）](#macos-launchd) |
-| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | 容器化环境；完整步骤见 [Docker](#docker)、[systemd](#systemd)、[macOS（launchd）](#macos-launchd) |
+| **Docker / Compose** | `docker run -p 8787:8787 synapse` | 容器化环境；完整步骤见 [Docker](#docker)、[systemd](#systemd)、[macOS（launchd）](#macos-launchd) |
 
 托管方式与路由方式正交：`upstream.responses_mode`（`convert` 与
 `passthrough`）和 `/v1/*` 透明转发在三种方式下行为相同。
@@ -305,7 +305,7 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 不启动服务即可校验配置：
 
 ```bash
-protocol-proxy check-config --config config.yaml
+synapse check-config --config config.yaml
 ```
 
 配置非法时以非零码退出，并精确指出字段与期望值。
@@ -316,17 +316,17 @@ Multi-stage 构建，最终镜像为 **distroless/static**（无 shell、无包�
 含 CA 证书），以 `nonroot` 用户运行：
 
 ```bash
-docker build -t protocol-proxy .
+docker build -t synapse .
 
 docker run --rm -p 8787:8787 \
-  -v "$PWD/config.example.yaml:/etc/protocol-proxy/config.yaml:ro" \
-  protocol-proxy
+  -v "$PWD/config.example.yaml:/etc/synapse/config.yaml:ro" \
+  synapse
 ```
 
 受限网络下用 Go 模块镜像构建：
 
 ```bash
-docker build --build-arg GOPROXY=https://goproxy.cn,direct -t protocol-proxy .
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t synapse .
 ```
 
 镜像内置 `HEALTHCHECK`，由二进制自带的 `healthcheck` 子命令实现
@@ -334,15 +334,15 @@ docker build --build-arg GOPROXY=https://goproxy.cn,direct -t protocol-proxy .
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["/protocol-proxy", "healthcheck"]
+    CMD ["/synapse", "healthcheck"]
 ```
 
 ### Docker Compose——upstream 在宿主机
 
 ```yaml
 services:
-  protocol-proxy:
-    image: protocol-proxy:latest
+  synapse:
+    image: synapse:latest
     build: .
     ports: ["8787:8787"]
     environment:
@@ -377,15 +377,15 @@ SIGTERM 时，Docker 的 `stop_grace_period`（保持大于
 ## systemd
 
 ```bash
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin protocol-proxy || true
-sudo install -Dm755 protocol-proxy /usr/local/bin/protocol-proxy
-sudo install -Dm644 config.example.yaml /etc/protocol-proxy/config.yaml
-sudo cp deploy/systemd/protocol-proxy.service /etc/systemd/system/
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin synapse || true
+sudo install -Dm755 synapse /usr/local/bin/synapse
+sudo install -Dm644 config.example.yaml /etc/synapse/config.yaml
+sudo cp deploy/systemd/synapse.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now protocol-proxy
+sudo systemctl enable --now synapse
 
-journalctl -u protocol-proxy -f        # journald 中的结构化 JSON 日志
-sudo systemctl restart protocol-proxy  # 先 drain 再重启
+journalctl -u synapse -f        # journald 中的结构化 JSON 日志
+sudo systemctl restart synapse  # 先 drain 再重启
 ```
 
 unit 以专用非 root 系统用户运行，故障自动重启，SIGTERM 有 35 秒 drain
@@ -400,28 +400,28 @@ macOS 原生的常驻机制是 launchd；仓库自带 LaunchAgent 模板：
 `DARWIN_ARCH=amd64`）：
 
 ```bash
-make build-darwin                # → protocol-proxy-darwin-arm64
-scp protocol-proxy-darwin-arm64 mac:/usr/local/bin/protocol-proxy
+make build-darwin                # → synapse-darwin-arm64
+scp synapse-darwin-arm64 mac:/usr/local/bin/synapse
 ```
 
-**2. 配置**安装到 `/usr/local/etc/protocol-proxy/config.yaml`
+**2. 配置**安装到 `/usr/local/etc/synapse/config.yaml`
 （格式与 Linux 相同）。
 
 **3. 安装 agent**（用户级、登录自启、无需 root）：
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
-cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+cp deploy/launchd/com.synapse.proxy.plist ~/Library/LaunchAgents/
 # 若安装路径不同，修改 plist 内的二进制/配置路径
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.proxy.plist
 ```
 
 **4. 管理**——SIGTERM 触发与 systemd 相同的优雅 drain：
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # 重启
-launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # 停止并卸载
-tail -f /tmp/protocol-proxy.log                                   # 日志
+launchctl kickstart -k gui/$(id -u)/com.synapse.proxy   # 重启
+launchctl bootout      gui/$(id -u)/com.synapse.proxy   # 停止并卸载
+tail -f /tmp/synapse.log                                   # 日志
 curl -s http://127.0.0.1:8787/health                              # 验证
 ```
 
@@ -434,7 +434,7 @@ journald；`KeepAlive` 对应 `Restart=`；局域网访问需在 系统设置 �
 
 ```
 开发机 A（LLM + 代理）                     开发机 B（Codex）
-  protocol-proxy :8787   <------ 局域网 ---->  base_url http://A:8787/v1
+  synapse :8787   <------ 局域网 ---->  base_url http://A:8787/v1
 ```
 
 1. A 上设 `server.listen: "0.0.0.0:8787"`，启动代理。
@@ -456,9 +456,9 @@ API Key 管理方式完全不变——Codex 发出的 `Authorization` header 原
 
 ```toml
 model = "your-model"
-model_provider = "protocol-proxy"
+model_provider = "synapse"
 
-[model_providers.protocol-proxy]
+[model_providers.synapse]
 name = "Custom Completions Provider"
 base_url = "http://192.168.1.100:8787/v1"
 wire_api = "responses"

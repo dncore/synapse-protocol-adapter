@@ -1,8 +1,8 @@
 # Fully containerized stack: proxy + upstream on one Docker network.
 # Copy to docker-compose.yml and adjust the upstream service.
 services:
-  protocol-proxy:
-    image: protocol-proxy:latest
+  synapse:
+    image: synapse:latest
     build: .
     ports:
       - "8787:8787"

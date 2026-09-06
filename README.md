@@ -94,16 +94,16 @@ Binary:
 git clone https://github.com/dncore/synapse-protocol-adapter
 cd synapse-protocol-adapter
 make build
-PROXY_UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1" ./protocol-proxy
+PROXY_UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1" ./synapse
 ```
 
 Docker:
 
 ```bash
-docker build -t protocol-proxy .
+docker build -t synapse .
 docker run --rm -p 8787:8787 \
   -e PROXY_UPSTREAM_BASE_URL="http://host.docker.internal:8000/v1" \
-  protocol-proxy
+  synapse
 ```
 
 Then point any Responses-API client at `http://<host>:8787/v1`.
@@ -116,10 +116,10 @@ identical in all three; pick by environment:
 
 | Option | Start | Best for |
 |---|---|---|
-| **Bare process** | `./protocol-proxy --config config.yaml` | Development, quick experiments |
-| **systemd service** | `systemctl enable --now protocol-proxy` | Linux servers, always-on daemons (auto-restart, journald, graceful drain) |
+| **Bare process** | `./synapse --config config.yaml` | Development, quick experiments |
+| **systemd service** | `systemctl enable --now synapse` | Linux servers, always-on daemons (auto-restart, journald, graceful drain) |
 | **launchd agent** | `launchctl bootstrap gui/$(id -u) …` | macOS hosts; see [macOS (launchd)](#macos-launchd) |
-| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | Containerized environments; see [Docker](#docker), [systemd](#systemd), [macOS (launchd)](#macos-launchd) for full setup |
+| **Docker / Compose** | `docker run -p 8787:8787 synapse` | Containerized environments; see [Docker](#docker), [systemd](#systemd), [macOS (launchd)](#macos-launchd) for full setup |
 
 How the daemon is hosted is orthogonal to how it routes: the
 `upstream.responses_mode` knob (`convert` vs `passthrough`) and the
@@ -322,7 +322,7 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 Validate without starting:
 
 ```bash
-protocol-proxy check-config --config config.yaml
+synapse check-config --config config.yaml
 ```
 
 Invalid configuration exits non-zero with the exact field and expectation.
@@ -333,17 +333,17 @@ Multi-stage build ending in **distroless/static** (no shell, no package
 manager, CA certificates included) running as the `nonroot` user:
 
 ```bash
-docker build -t protocol-proxy .
+docker build -t synapse .
 
 docker run --rm -p 8787:8787 \
-  -v "$PWD/config.example.yaml:/etc/protocol-proxy/config.yaml:ro" \
-  protocol-proxy
+  -v "$PWD/config.example.yaml:/etc/synapse/config.yaml:ro" \
+  synapse
 ```
 
 Behind a restricted network, build with a Go module mirror:
 
 ```bash
-docker build --build-arg GOPROXY=https://goproxy.cn,direct -t protocol-proxy .
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t synapse .
 ```
 
 The image defines a `HEALTHCHECK` backed by the binary's built-in
@@ -351,15 +351,15 @@ The image defines a `HEALTHCHECK` backed by the binary's built-in
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["/protocol-proxy", "healthcheck"]
+    CMD ["/synapse", "healthcheck"]
 ```
 
 ### Docker Compose — upstream on the host
 
 ```yaml
 services:
-  protocol-proxy:
-    image: protocol-proxy:latest
+  synapse:
+    image: synapse:latest
     build: .
     ports: ["8787:8787"]
     environment:
@@ -394,15 +394,15 @@ immediately, the process exits 0 when drained.
 ## systemd
 
 ```bash
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin protocol-proxy || true
-sudo install -Dm755 protocol-proxy /usr/local/bin/protocol-proxy
-sudo install -Dm644 config.example.yaml /etc/protocol-proxy/config.yaml
-sudo cp deploy/systemd/protocol-proxy.service /etc/systemd/system/
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin synapse || true
+sudo install -Dm755 synapse /usr/local/bin/synapse
+sudo install -Dm644 config.example.yaml /etc/synapse/config.yaml
+sudo cp deploy/systemd/synapse.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now protocol-proxy
+sudo systemctl enable --now synapse
 
-journalctl -u protocol-proxy -f        # structured JSON logs in journald
-sudo systemctl restart protocol-proxy  # drains, then restarts
+journalctl -u synapse -f        # structured JSON logs in journald
+sudo systemctl restart synapse  # drains, then restarts
 ```
 
 The unit runs as a dedicated non-root system user, restarts on failure,
@@ -417,28 +417,28 @@ ready LaunchAgent at [`deploy/launchd/`](deploy/launchd/).
 `DARWIN_ARCH=amd64`):
 
 ```bash
-make build-darwin                # → protocol-proxy-darwin-arm64
-scp protocol-proxy-darwin-arm64 mac:/usr/local/bin/protocol-proxy
+make build-darwin                # → synapse-darwin-arm64
+scp synapse-darwin-arm64 mac:/usr/local/bin/synapse
 ```
 
-**2. Install config** at `/usr/local/etc/protocol-proxy/config.yaml`
+**2. Install config** at `/usr/local/etc/synapse/config.yaml`
 (same format as Linux).
 
 **3. Install the agent** (per-user, starts at login, no root):
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
-cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+cp deploy/launchd/com.synapse.proxy.plist ~/Library/LaunchAgents/
 # adjust binary/config paths inside the plist if you installed elsewhere
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.proxy.plist
 ```
 
 **4. Manage** — SIGTERM triggers the same graceful drain as systemd:
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # restart
-launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # stop & unload
-tail -f /tmp/protocol-proxy.log                                   # logs
+launchctl kickstart -k gui/$(id -u)/com.synapse.proxy   # restart
+launchctl bootout      gui/$(id -u)/com.synapse.proxy   # stop & unload
+tail -f /tmp/synapse.log                                   # logs
 curl -s http://127.0.0.1:8787/health                              # verify
 ```
 
@@ -452,7 +452,7 @@ itself.
 
 ```
 Developer Machine A (LLM + proxy)          Developer Machine B (Codex)
-  protocol-proxy :8787   <------ LAN ----->   base_url http://A:8787/v1
+  synapse :8787   <------ LAN ----->   base_url http://A:8787/v1
 ```
 
 1. On A: `server.listen: "0.0.0.0:8787"`, start the proxy.
@@ -474,9 +474,9 @@ translates internally. Your API key handling stays exactly as it is — the
 
 ```toml
 model = "your-model"
-model_provider = "protocol-proxy"
+model_provider = "synapse"
 
-[model_providers.protocol-proxy]
+[model_providers.synapse]
 name = "Custom Completions Provider"
 base_url = "http://192.168.1.100:8787/v1"
 wire_api = "responses"

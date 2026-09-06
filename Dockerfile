@@ -18,25 +18,25 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/protocol-proxy ./cmd/proxy
+    -o /out/synapse ./cmd/proxy
 
 # ---- runtime stage ----
 # distroless/static: no shell, no package manager, CA certs included,
 # non-root by default via the `nonroot` user.
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=build /out/protocol-proxy /protocol-proxy
+COPY --from=build /out/synapse /synapse
 
-# Config lives at /etc/protocol-proxy/config.yaml (mount read-only).
+# Config lives at /etc/synapse/config.yaml (mount read-only).
 ENV PROXY_SERVER_LISTEN=0.0.0.0:8787
 
 EXPOSE 8787
 
 # distroless ships no curl/wget; the binary checks its own health endpoint.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/protocol-proxy", "healthcheck"]
+    CMD ["/synapse", "healthcheck"]
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/protocol-proxy"]
-CMD ["--config", "/etc/protocol-proxy/config.yaml"]
+ENTRYPOINT ["/synapse"]
+CMD ["--config", "/etc/synapse/config.yaml"]
