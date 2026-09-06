@@ -102,6 +102,20 @@ docker run --rm -p 8787:8787 \
 
 随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`。
 
+## 运行 daemon 的三种方式
+
+同一个静态二进制，三种可互换的托管方式。行为——配置、路由
+（`responses_mode`）、流式、metrics——三者完全一致，按环境选择：
+
+| 方式 | 启动 | 适用 |
+|---|---|---|
+| **裸进程** | `./protocol-proxy --config config.yaml` | 开发调试、快速实验 |
+| **systemd 服务** | `systemctl enable --now protocol-proxy` | Linux 服务器常驻（自动重启、journald 日志、优雅退出） |
+| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | 容器化环境；完整步骤见 [Docker](#docker) 与 [systemd](#systemd) |
+
+托管方式与路由方式正交：`upstream.responses_mode`（`convert` 与
+`passthrough`）和 `/v1/*` 透明转发在三种方式下行为相同。
+
 ## 协议转换语义
 
 | 端点 | 说明 |

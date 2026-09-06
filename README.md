@@ -108,6 +108,22 @@ docker run --rm -p 8787:8787 \
 
 Then point any Responses-API client at `http://<host>:8787/v1`.
 
+## Running the daemon
+
+One static binary, three interchangeable hosting options. Behavior —
+configuration, routing (`responses_mode`), streaming, metrics — is
+identical in all three; pick by environment:
+
+| Option | Start | Best for |
+|---|---|---|
+| **Bare process** | `./protocol-proxy --config config.yaml` | Development, quick experiments |
+| **systemd service** | `systemctl enable --now protocol-proxy` | Linux servers, always-on daemons (auto-restart, journald, graceful drain) |
+| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | Containerized environments; see [Docker](#docker) and [systemd](#systemd) for full setup |
+
+How the daemon is hosted is orthogonal to how it routes: the
+`upstream.responses_mode` knob (`convert` vs `passthrough`) and the
+transparent `/v1/*` forwarding behave the same under all three.
+
 ## Protocol conversion semantics
 
 | Endpoint | Description |
