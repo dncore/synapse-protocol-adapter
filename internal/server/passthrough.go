@@ -45,7 +45,7 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 
 	upStart := time.Now()
 	resp, err := s.client.DoPassthrough(ctx, r.Method,
-		strings.TrimPrefix(r.URL.Path, "/v1"), r.URL.RawQuery, body, r.Header)
+		stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -100,6 +100,16 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 	s.metrics.ResponsesTotal.Inc()
 	s.metrics.RequestDuration.Observe(time.Since(start).Seconds())
+}
+
+// stripAPIPrefix removes the client-facing API prefix (/v1 or /api/v1) so
+// the remainder routes onto the configured base_url, whichever path
+// convention the client was configured with.
+func stripAPIPrefix(p string) string {
+	if strings.HasPrefix(p, "/api/v1") {
+		return strings.TrimPrefix(p, "/api/v1")
+	}
+	return strings.TrimPrefix(p, "/v1")
 }
 
 // countingReader streams through while tallying bytes into a counter.

@@ -61,16 +61,18 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
-	// In passthrough mode the upstream's native /responses endpoint wins:
-	// the /v1/ catch-all forwards it untouched instead of converting.
+	// Clients configured in the provider's own path style hit /api/v1/*,
+	// so both prefixes are served: /v1/responses and /api/v1/responses are
+	// the same route, letting clients migrate by swapping the host only.
 	if cfg.Upstream.ResponsesMode != "passthrough" {
 		mux.HandleFunc("POST /v1/responses", s.handleResponses)
+		mux.HandleFunc("POST /api/v1/responses", s.handleResponses)
 	}
-	// Everything else under /v1/ transparently forwards to the upstream
-	// (same method/path/query, streamed both ways): /v1/chat/completions,
-	// /v1/models, ... The more specific /v1/responses pattern wins for the
-	// converted route.
+	// Everything else under the API prefixes transparently forwards to the
+	// upstream (same method/path/query, streamed both ways). The more
+	// specific /responses patterns win for the converted route.
 	mux.HandleFunc("/v1/", s.handlePassthrough)
+	mux.HandleFunc("/api/v1/", s.handlePassthrough)
 
 	// Middleware order (outermost first): RequestID assigns the ID so every
 	// inner layer (including logs and panics) can reference it; AccessLog

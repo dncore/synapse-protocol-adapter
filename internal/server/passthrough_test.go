@@ -304,6 +304,59 @@ func TestResponsesMode_ConvertDefault(t *testing.T) {
 	}
 }
 
+func TestAPIPrefixStyle(t *testing.T) {
+	// Clients configured with provider-native paths (/api/v1/*) must be
+	// served identically to /v1/* clients: host swap, nothing else.
+	var gotPath string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"object":"list"}`))
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	for _, p := range []string{"/v1/models", "/api/v1/models"} {
+		resp, err := http.Get(proxy.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if gotPath != "/models" {
+			t.Fatalf("%s forwarded as %s, want /models", p, gotPath)
+		}
+	}
+}
+
+func TestAPIPrefixStyle_ResponsesConvert(t *testing.T) {
+	var gotPath string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/api/v1/responses", "application/json",
+		strings.NewReader(`{"model":"m","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if gotPath != "/chat/completions" {
+		t.Fatalf("/api/v1/responses must convert via /chat/completions, saw %s", gotPath)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
