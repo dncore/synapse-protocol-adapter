@@ -209,8 +209,7 @@ func TestConvertRequest_Errors(t *testing.T) {
 	}{
 		{"previous_response_id", &responses.Request{Model: "m", Input: responses.Input{String: "x"}, PreviousResponseID: &prev}},
 		{"empty input", &responses.Request{Model: "m"}},
-		{"unsupported item", &responses.Request{Model: "m", Input: responses.Input{Items: []responses.Item{{Type: "web_search_call"}}}}},
-		{"bad role", &responses.Request{Model: "m", Input: responses.Input{Items: []responses.Item{{Type: "message", Role: "wizard"}}}}},
+		{"only unknown items", &responses.Request{Model: "m", Input: responses.Input{Items: []responses.Item{{Type: "web_search_call"}}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -218,6 +217,28 @@ func TestConvertRequest_Errors(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+// Unknown item types and roles in replayed history must not kill the
+// session: they are dropped while the rest of the conversation converts.
+func TestConvertRequest_LenientHistory(t *testing.T) {
+	req := &responses.Request{
+		Model: "m",
+		Input: responses.Input{Items: []responses.Item{
+			{Type: "message", Role: "user", Content: responses.ItemContent{String: "hi"}},
+			{Type: "custom_tool_call", Name: "patch"},
+			{Type: "local_shell_call"},
+			{Type: "message", Role: "wizard", Content: responses.ItemContent{String: "??"}},
+			{Type: "message", Role: "user", Content: responses.ItemContent{String: "there"}},
+		}},
+	}
+	out, err := ConvertRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Messages) != 2 {
+		t.Fatalf("want 2 messages after lenient dropping, got %d: %+v", len(out.Messages), out.Messages)
 	}
 }
 

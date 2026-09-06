@@ -390,6 +390,25 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 			continue
 		}
 
+		// In-band rejection (HTTP 200 + {"error":...} chunk): a gateway
+		// refusing the model or quota. Fail loudly instead of completing
+		// an empty response.
+		if chunk.Error != nil && chunk.Error.Message != "" {
+			s.metrics.UpstreamErrorsTotal.With("stream_in_band_error").Inc()
+			s.logger.Warn("upstream rejected request in-band",
+				"request_id", middleware.RequestIDOf(r),
+				"error_type", chunk.Error.Type, "code", chunk.Error.Code)
+			_ = sw.WriteEvent("error", map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"code":    orDefault(chunk.Error.Code, "upstream_error"),
+					"message": chunk.Error.Message,
+					"type":    orDefault(chunk.Error.Type, "upstream_error"),
+				},
+			})
+			return
+		}
+
 		for _, ev := range streamer.Feed(&chunk) {
 			if !writeEvent(ev) {
 				return

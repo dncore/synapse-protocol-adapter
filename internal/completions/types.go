@@ -159,6 +159,12 @@ type StreamChunk struct {
 	Model   string        `json:"model"`
 	Choices []StreamChoice `json:"choices"`
 	Usage   *Usage        `json:"usage,omitempty"`
+	// Error carries in-band failures: several gateways reject requests
+	// (model access denied, quota exhausted) by answering HTTP 200 and
+	// streaming a single {"error":{...}} data chunk instead of a proper
+	// status code. Surfacing these is the difference between a clear
+	// client error and a silent empty response.
+	Error *ErrorBody `json:"error,omitempty"`
 }
 
 // StreamChoice is one choice inside a StreamChunk. Delta carries the

@@ -428,6 +428,37 @@ func TestProxy_Concurrency(t *testing.T) {
 	}
 }
 
+// In-band rejection: gateway answers HTTP 200 but streams {"error":{...}}
+// as the (only) chunk. The client must see a clear error event, never a
+// silently empty response.completed.
+func TestProxy_StreamInBandError(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "data: {\"error\":{\"message\":\"Model access denied\",\"type\":\"forbidden\",\"model\":\"x\"}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/v1/responses", "application/json", strings.NewReader(responsesBody(true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if !strings.Contains(text, `"type":"error"`) || !strings.Contains(text, "Model access denied") {
+		t.Fatalf("in-band error not surfaced:\n%s", text)
+	}
+	if strings.Contains(text, "response.completed") {
+		t.Fatalf("must not complete after in-band rejection:\n%s", text)
+	}
+}
+
 func TestOperationalEndpoints(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer up.Close()

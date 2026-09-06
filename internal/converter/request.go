@@ -81,10 +81,13 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 				if err != nil {
 					return nil, err
 				}
-				if m.Role == "system" || m.Role == "developer" {
+				if m == nil {
+					continue // unknown role in replayed history; skip
+				}
+				if m.Role == "system" {
 					hasSystem = true
 				}
-				msgs = append(msgs, m)
+				msgs = append(msgs, *m)
 			case "function_call":
 				call := completions.ToolCall{
 					// Some clients put the id only in `id` when replaying
@@ -118,7 +121,11 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 				// Reasoning items carry no chat-completions equivalent and
 				// no forward-relevant payload; drop them.
 			default:
-				return nil, fmt.Errorf("unsupported input item type %q", item.Type)
+				// Unknown item types (e.g. custom_tool_call, local_shell_call
+				// produced by a native Responses endpoint in an earlier turn)
+				// are dropped rather than rejected: replayed history must not
+				// kill the session over items this route cannot represent.
+				continue
 			}
 		}
 	}
@@ -138,8 +145,9 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 }
 
 // convertMessageItem translates a Responses message item into a chat
-// message, mapping content part types.
-func convertMessageItem(item *responses.Item) (completions.Message, error) {
+// message, mapping content part types. A nil return means "skip": the item
+// carries no chat representation (unknown role in replayed history).
+func convertMessageItem(item *responses.Item) (*completions.Message, error) {
 	role := item.Role
 	switch role {
 	case "developer":
@@ -148,7 +156,7 @@ func convertMessageItem(item *responses.Item) (completions.Message, error) {
 		role = "system"
 	case "system", "user", "assistant", "tool":
 	default:
-		return completions.Message{}, fmt.Errorf("unsupported message role %q", item.Role)
+		return nil, nil
 	}
 
 	m := completions.Message{Role: role}
@@ -170,12 +178,14 @@ func convertMessageItem(item *responses.Item) (completions.Message, error) {
 					ImageURL: &completions.ImageURL{URL: p.ImageURL},
 				})
 			default:
-				return completions.Message{}, fmt.Errorf("unsupported content part type %q", p.Type)
+				// Unknown part types (input_file, guarded_text, ...) are
+				// dropped rather than rejected.
+				continue
 			}
 		}
 		m.Content = completions.MessageContent{Parts: parts}
 	}
-	return m, nil
+	return &m, nil
 }
 
 // toolOutputContent flattens a tool output (string or typed parts) into a
