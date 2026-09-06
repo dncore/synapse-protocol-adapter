@@ -1,0 +1,15 @@
+{
+  "name": "@dncore/synapse-darwin-x64",
+  "version": "0.0.0",
+  "description": "Prebuilt synapse binary for darwin x64",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ]
+}

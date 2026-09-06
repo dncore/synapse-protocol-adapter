@@ -1,6 +1,9 @@
 .git
 .claude
 .remember
+npm/
+scripts/
+.github/
 tests/
 deploy/
 docs/

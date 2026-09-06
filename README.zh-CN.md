@@ -100,6 +100,20 @@ docker run --rm -p 8787:8787 \
   synapse
 ```
 
+npm（预编译二进制，Node 只是启动器——esbuild 式分发）：
+
+```bash
+npm install -g @dncore/synapse
+synapse --config config.example.yaml
+```
+
+或直接下载 Release 二进制：
+
+```bash
+curl -LO https://github.com/dncore/synapse-protocol-adapter/releases/latest/download/synapse-linux-x64
+chmod +x synapse-linux-x64 && ./synapse-linux-x64 --version
+```
+
 随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`。
 
 ## 运行 daemon 的三种方式

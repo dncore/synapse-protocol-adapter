@@ -106,6 +106,21 @@ docker run --rm -p 8787:8787 \
   synapse
 ```
 
+npm (prebuilt binary; Node is only the launcher — esbuild-style
+distribution):
+
+```bash
+npm install -g @dncore/synapse
+synapse --config config.example.yaml
+```
+
+Or grab a release binary directly:
+
+```bash
+curl -LO https://github.com/dncore/synapse-protocol-adapter/releases/latest/download/synapse-linux-x64
+chmod +x synapse-linux-x64 && ./synapse-linux-x64 --version
+```
+
 Then point any Responses-API client at `http://<host>:8787/v1`.
 
 ## Running the daemon

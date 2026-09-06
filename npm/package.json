@@ -1,0 +1,26 @@
+{
+  "name": "@dncore/synapse",
+  "version": "0.0.0",
+  "description": "Stateless, high-concurrency OpenAI Responses API to Chat Completions protocol adapter (prebuilt Go binary)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dncore/synapse-protocol-adapter.git"
+  },
+  "bin": {
+    "synapse": "bin/synapse.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@dncore/synapse-linux-x64": "0.0.0",
+    "@dncore/synapse-linux-arm64": "0.0.0",
+    "@dncore/synapse-darwin-x64": "0.0.0",
+    "@dncore/synapse-darwin-arm64": "0.0.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
