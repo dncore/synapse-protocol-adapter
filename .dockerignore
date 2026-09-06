@@ -1,0 +1,12 @@
+.git
+.claude
+.remember
+tests/
+deploy/
+docs/
+*.md
+config.yaml
+config.*.local.yaml
+Dockerfile
+docker-compose*.yml
+Makefile

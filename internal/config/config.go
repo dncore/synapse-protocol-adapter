@@ -1,0 +1,232 @@
+// Package config loads, env-overrides, and validates the proxy
+// configuration. The config deliberately contains no credentials: the
+// proxy forwards client Authorization headers verbatim and never stores
+// API keys.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the full proxy configuration tree.
+type Config struct {
+	Server   Server   `yaml:"server"`
+	Upstream Upstream `yaml:"upstream"`
+	Limits   Limits   `yaml:"limits"`
+	Timeouts Timeouts `yaml:"timeouts"`
+	Shutdown Shutdown `yaml:"shutdown"`
+	Log      Log      `yaml:"log"`
+}
+
+// Server is the listener configuration.
+type Server struct {
+	Listen string `yaml:"listen"`
+}
+
+// Upstream is the target chat completions provider.
+type Upstream struct {
+	// BaseURL is everything before the completions path, e.g.
+	// "http://127.0.0.1:8000/v1".
+	BaseURL string `yaml:"base_url"`
+	// Path is appended to BaseURL; defaults to /chat/completions.
+	Path string `yaml:"path"`
+}
+
+// URL returns the absolute completions endpoint.
+func (u Upstream) URL() string {
+	path := u.Path
+	if path == "" {
+		path = "/chat/completions"
+	}
+	return strings.TrimRight(u.BaseURL, "/") + path
+}
+
+// Limits bounds resource usage.
+type Limits struct {
+	MaxConcurrency int `yaml:"max_concurrency"`
+	MaxBodyBytes   int `yaml:"max_body_bytes"`
+	MaxSSELine     int `yaml:"max_sse_line_bytes"`
+}
+
+// Timeouts tunes the HTTP server and upstream transport.
+type Timeouts struct {
+	Connect        time.Duration `yaml:"connect"`
+	Request        time.Duration `yaml:"request"`
+	Idle           time.Duration `yaml:"idle"`
+	StreamWrite    time.Duration `yaml:"stream_write"`
+	HeaderWrite    time.Duration `yaml:"header_write"`
+}
+
+// Shutdown tunes graceful shutdown.
+type Shutdown struct {
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// Log tunes logging output.
+type Log struct {
+	Format string `yaml:"format"` // "json" | "text"
+	Level  string `yaml:"level"`  // "debug" | "info" | "warn" | "error"
+}
+
+// Defaults returns the built-in configuration.
+func Defaults() Config {
+	return Config{
+		Server:   Server{Listen: "0.0.0.0:8787"},
+		Upstream: Upstream{BaseURL: "http://127.0.0.1:8000/v1"},
+		Limits: Limits{
+			MaxConcurrency: 200,
+			MaxBodyBytes:   64 << 20, // 64 MiB: conversation histories can be large
+			MaxSSELine:     16 << 20, // 16 MiB max SSE data line
+		},
+		Timeouts: Timeouts{
+			Connect:     10 * time.Second,
+			Request:     30 * time.Minute,
+			Idle:        5 * time.Minute,
+			StreamWrite: 5 * time.Minute,
+			HeaderWrite: 60 * time.Second,
+		},
+		Shutdown: Shutdown{Timeout: 30 * time.Second},
+		Log:      Log{Format: "json", Level: "info"},
+	}
+}
+
+// Load reads the YAML file (if path is non-empty), applies PROXY_*
+// environment overrides, then validates. An empty path yields defaults
+// plus env overrides.
+func Load(path string) (Config, error) {
+	cfg := Defaults()
+	if path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return cfg, fmt.Errorf("read config: %w", err)
+		}
+		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+			return cfg, fmt.Errorf("parse config %s: %w", path, err)
+		}
+	}
+	applyEnv(&cfg)
+	if err := Validate(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// applyEnv overrides config values from PROXY_<SECTION>_<KEY> environment
+// variables, e.g. PROXY_SERVER_LISTEN, PROXY_UPSTREAM_BASE_URL.
+func applyEnv(cfg *Config) {
+	if v := os.Getenv("PROXY_SERVER_LISTEN"); v != "" {
+		cfg.Server.Listen = v
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_BASE_URL"); v != "" {
+		cfg.Upstream.BaseURL = v
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_PATH"); v != "" {
+		cfg.Upstream.Path = v
+	}
+	if v := os.Getenv("PROXY_LIMITS_MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Limits.MaxConcurrency = n
+		}
+	}
+	if v := os.Getenv("PROXY_LIMITS_MAX_BODY_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Limits.MaxBodyBytes = n
+		}
+	}
+	if v := os.Getenv("PROXY_TIMEOUTS_CONNECT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Timeouts.Connect = d
+		}
+	}
+	if v := os.Getenv("PROXY_TIMEOUTS_REQUEST"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Timeouts.Request = d
+		}
+	}
+	if v := os.Getenv("PROXY_TIMEOUTS_IDLE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Timeouts.Idle = d
+		}
+	}
+	if v := os.Getenv("PROXY_TIMEOUTS_STREAM_WRITE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Timeouts.StreamWrite = d
+		}
+	}
+	if v := os.Getenv("PROXY_SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Shutdown.Timeout = d
+		}
+	}
+	if v := os.Getenv("PROXY_LOG_FORMAT"); v != "" {
+		cfg.Log.Format = v
+	}
+	if v := os.Getenv("PROXY_LOG_LEVEL"); v != "" {
+		cfg.Log.Level = v
+	}
+}
+
+// Validate reports configuration errors with actionable messages.
+func Validate(cfg *Config) error {
+	var errs []error
+
+	if cfg.Server.Listen == "" {
+		errs = append(errs, errors.New("server.listen must be set (e.g. \"0.0.0.0:8787\")"))
+	}
+	if cfg.Upstream.BaseURL == "" {
+		errs = append(errs, errors.New("upstream.base_url must be set (e.g. \"http://127.0.0.1:8000/v1\")"))
+	} else {
+		u, err := url.Parse(cfg.Upstream.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("upstream.base_url %q is not a valid http(s) URL", cfg.Upstream.BaseURL))
+		}
+	}
+	if cfg.Limits.MaxConcurrency <= 0 {
+		errs = append(errs, errors.New("limits.max_concurrency must be > 0"))
+	}
+	if cfg.Limits.MaxBodyBytes <= 0 {
+		errs = append(errs, errors.New("limits.max_body_bytes must be > 0"))
+	}
+	if cfg.Timeouts.Connect <= 0 {
+		errs = append(errs, errors.New("timeouts.connect must be > 0 (e.g. 10s)"))
+	}
+	if cfg.Timeouts.Request <= 0 {
+		errs = append(errs, errors.New("timeouts.request must be > 0 (e.g. 30m)"))
+	}
+	if cfg.Timeouts.Idle <= 0 {
+		errs = append(errs, errors.New("timeouts.idle must be > 0 (e.g. 5m)"))
+	}
+	if cfg.Timeouts.StreamWrite <= 0 {
+		errs = append(errs, errors.New("timeouts.stream_write must be > 0 (e.g. 5m)"))
+	}
+	if cfg.Shutdown.Timeout <= 0 {
+		errs = append(errs, errors.New("shutdown.timeout must be > 0 (e.g. 30s)"))
+	}
+	switch cfg.Log.Format {
+	case "json", "text":
+	default:
+		errs = append(errs, fmt.Errorf("log.format must be \"json\" or \"text\", got %q", cfg.Log.Format))
+	}
+	switch cfg.Log.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("log.level must be debug|info|warn|error, got %q", cfg.Log.Level))
+	}
+
+	return errors.Join(errs...)
+}
+
+// Describe renders the effective config with secrets-free fields only
+// (there are no secret fields by design).
+func Describe(cfg *Config) string {
+	b, _ := yaml.Marshal(cfg)
+	return string(b)
+}

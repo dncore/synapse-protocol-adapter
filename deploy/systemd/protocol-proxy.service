@@ -1,0 +1,45 @@
+# protocol-proxy systemd unit.
+#
+# Install:
+#   sudo cp deploy/systemd/protocol-proxy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now protocol-proxy
+#
+# The binary is expected at /usr/local/bin/protocol-proxy and the config
+# at /etc/protocol-proxy/config.yaml (see ExecStart; adjust to taste).
+
+[Unit]
+Description=Responses -> Completions protocol proxy (synapse-protocol-adapter)
+Documentation=https://github.com/dncore/synapse-protocol-adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=protocol-proxy
+Group=protocol-proxy
+# Hardening: no new privileges, isolated temp/home.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+ExecStart=/usr/local/bin/protocol-proxy --config /etc/protocol-proxy/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# graceful shutdown: SIGTERM drains in-flight streams up to
+# shutdown.timeout; TimeoutStopSec must exceed it.
+KillSignal=SIGTERM
+TimeoutStopSec=35s
+
+# Restart on unexpected exit; drain failures exit cleanly (0).
+Restart=on-failure
+RestartSec=2s
+
+# Logs go to journald (structured JSON lines; view with journalctl -u protocol-proxy).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,464 @@
+# Synapse Protocol Adapter
+
+**[English](README.md)** | **[中文文档](README.zh-CN.md)**
+
+一个小型、无状态、高并发的协议适配器：对客户端暴露 **OpenAI Responses API**，对 upstream 使用 **OpenAI Chat Completions API**。让 Codex（或任何 Responses API 客户端）直接接入任意 chat-completions 后端。
+
+```
+Client / Codex / Agent              (Responses API)
+        |
+        |  POST /v1/responses
+        v
++-------------------------------------------+
+|         synapse-protocol-adapter          |
+|                                           |
+|   Responses  ->  Chat Completions         |
+|   Streaming SSE 转换                      |
+|   Tool-call 转换                          |
+|   Header 透传                             |
++-------------------------------------------+
+        |
+        |  POST /v1/chat/completions
+        v
+Custom LLM Provider                 (Chat Completions API)
+```
+
+它是一个**透明的协议适配器**，仅此而已：
+
+- ❌ 不管理 API Key——从不生成、存储或改写凭据
+- ❌ 无账号体系、无 OAuth、无计费、无 Key 池
+- ❌ 不保存会话/对话——重启后完全无状态
+- ✅ 客户端的 `Authorization` 及其他 header **原样透传**到 upstream
+- ✅ 真正逐 chunk 的 SSE 流式转换，逐事件 flush
+- ✅ 客户端断开立即取消 upstream 请求
+- ✅ 单静态二进制 · Docker · systemd · SIGTERM 优雅退出
+
+## 架构
+
+```
+                        ┌───────────────────────────────────────────────────────────────┐
+                        │                    synapse-protocol-adapter                   │
+                        │                                                               │
+  Codex / Agents        │  ┌────────────┐    ┌────────────┐    ┌────────────────────┐   │      LLM Provider
+  (Responses API)       │  │  responses │    │ converter  │    │    completions     │   │   (Chat Completions)
+                        │  │   types    │───▶│ 纯函数转换  │───▶│   (upstream IR)    │───┼───────────────────▶
+   POST /v1/responses   │  │  (wire)    │    │            │    │                    │   │  POST {base}/chat/
+  ──────────────────────┼─▶│            │    └────────────┘    └────────────────────┘   │       completions
+   Authorization ───────┼─▶│            │          │                        ▲           │
+   X-*, OpenAI-* ───────┼─▶│            │          ▼                        │           │
+                        │  │            │    ┌────────────┐                 │           │
+                        │  │            │    │ Streamer   │  chunk 进,       │           │
+                        │  │            │    │ (流式状态机)│  events 出       │           │
+                        │  │            │    └────────────┘                 │           │
+                        │  └────────────┘          │                        │           │
+                        │         ▲                ▼                        │           │
+                        │  ┌────────────┐    ┌────────────┐    ┌────────────────────┐   │
+   SSE events           │  │ streaming: │◀───│ streaming: │◀───│  upstream client   │───┼──── SSE / JSON
+  ◀─────────────────────┼──│ writer     │    │ reader     │    │ (header 过滤,      │   │◀──────────────────
+   逐事件 flush          │  │ (逐事件flush)│   │ (抗拆分)    │    │  keep-alive 连接池)│   │
+                        │  └────────────┘    └────────────┘    └────────────────────┘   │
+                        │  middleware: request-id -> access-log -> recover               │
+                        │  运维面: /health /ready /metrics   生命周期: graceful shutdown  │
+                        └───────────────────────────────────────────────────────────────┘
+```
+
+流式管线（任何环节都不缓冲完整响应）：
+
+```
+upstream SSE ──▶ 逐行增量解析 ──────▶ converter.Streamer ──▶ Responses event ──▶ flush ──▶ client
+   (字节流)      (TCP/UTF-8/JSON 拆分安全,   (每请求状态: 输出 item、    (携带递增             (立即、
+                 有界缓冲区)               tool call 累积器)         sequence_number)      逐事件)
+```
+
+设计不变量：
+
+| 不变量 | 实现方式 |
+|---|---|
+| Stateless | 所有转换状态都在单次请求的 `converter.Streamer` 内，响应结束即释放 |
+| Streaming first | 每个 upstream chunk 到达即转换、即 flush |
+| Cancellation first | `r.Context()` → upstream 请求 context；流中客户端写失败显式 cancel |
+| Backpressure | 零缓冲：客户端写阻塞 → 停止读 upstream → TCP 背压自然传导 |
+| Transparent | 除 RFC hop-by-hop + `Host`/`Content-Length`/`Accept-Encoding` 外全部透传 |
+
+## 快速开始
+
+二进制：
+
+```bash
+git clone https://github.com/dncore/synapse-protocol-adapter
+cd synapse-protocol-adapter
+make build
+PROXY_UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1" ./protocol-proxy
+```
+
+Docker：
+
+```bash
+docker build -t protocol-proxy .
+docker run --rm -p 8787:8787 \
+  -e PROXY_UPSTREAM_BASE_URL="http://host.docker.internal:8000/v1" \
+  protocol-proxy
+```
+
+随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`。
+
+## 协议转换语义
+
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/responses` | 完整转换，流式与非流式 |
+| `GET /health` | 存活——进程运行即 200 |
+| `GET /ready` | 就绪——shutdown 开始即 503 |
+| `GET /metrics` | Prometheus 文本格式 |
+| `GET /version` | 构建版本 |
+| `GET /` | 端点列表 |
+
+### 请求映射（Responses → Chat Completions）
+
+| Responses | Chat Completions |
+|---|---|
+| `model` | `model` |
+| `instructions` | 前置 `system` 消息（input 已有 system 则跳过） |
+| `input`（字符串） | 一条 `user` 消息 |
+| `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
+| `input_text` / `output_text` / `summary_text` part | `{type:"text"}` part |
+| `input_image` part | `{type:"image_url", image_url:{url}}` part |
+| `function_call` item | 带 `tool_calls[]` 的 assistant 消息 |
+| `function_call_output` item | `{role:"tool", tool_call_id, content}` |
+| `reasoning` item | 丢弃（chat 侧无对应） |
+| `tools[]`（扁平结构） | `tools[]`（嵌套 `function` 对象） |
+| `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 同名，对象形式重新嵌套 |
+| `max_output_tokens` | `max_tokens` |
+| `temperature`、`top_p`、`parallel_tool_calls`、`user` | 同名 |
+| `response_format` / `text.format`（`json_schema`/`json_object`/`text`） | `response_format` |
+| `stream: true` | `stream: true` + `stream_options:{include_usage:true}` |
+| `store`、`metadata`、`include`、`truncation`、`reasoning` | 忽略 |
+| `previous_response_id` | **返回 400**——它依赖服务端会话状态，而本代理刻意不保存任何会话；请把完整对话放进 `input`（Codex 默认如此） |
+
+### 响应映射（Chat Completions → Responses）
+
+| Upstream | 客户端看到 |
+|---|---|
+| `choices[0].message.content` | `output[]: {type:"message", content:[{type:"output_text"}]}` |
+| `choices[0].message.tool_calls[]` | 每项一个 `{type:"function_call"}` 输出 item（并行调用保留） |
+| `finish_reason: stop / tool_calls` | `status: "completed"` |
+| `finish_reason: length` | `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"` |
+| `finish_reason: content_filter` | `status: "incomplete"` + `incomplete_details.reason: "content_filter"` |
+| `usage.prompt/completion/total_tokens` | `usage.input/output/total_tokens` |
+| upstream HTTP 错误 | 状态码保留，错误体重塑为 Responses 形状 |
+
+### 流式事件映射
+
+```
+upstream chunk                          Responses 事件
+--------------------------------------- -------------------------------------------
+首个 chunk                             response.created, response.in_progress
+delta.content（首次）                   response.output_item.added (message),
+                                        response.content_part.added
+delta.content                           response.output_text.delta
+delta.tool_calls[i]（首次出现）         response.output_item.added (function_call)
+delta.tool_calls[i].function.arguments  response.function_call_arguments.delta
+finish_reason                           output_text.done, content_part.done,
+                                        output_item.done,
+                                        function_call_arguments.done
+末尾 usage chunk（空 choices）           （计入 usage）
+[DONE]                                  response.completed（聚合响应 + usage）
+```
+
+事件携带严格递增的 `sequence_number`。tool-call 参数按 delta `index`
+累积，交错到达的并行 tool call 也能正确重组。中途断流的流会产生带内
+`error` SSE 事件（此时 HTTP header 已提交）。
+
+### Header 处理
+
+以下清单之外的**所有** header 原样转发到 upstream——包括
+`Authorization`、`OpenAI-*`、`X-*` 与自定义 header：
+
+- Hop-by-hop（RFC 9110）：`Connection`、`Keep-Alive`、`Proxy-Authenticate`、
+  `Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`
+- 由代理重算：`Host`、`Content-Length`
+- `Accept-Encoding`：代理必须解析 SSE body，因此由 Go transport 自行
+  协商 gzip 并透明解压
+
+## 配置
+
+YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
+参见 [`config.example.yaml`](config.example.yaml)。
+
+| 配置项 | 默认值 | 环境变量 | 说明 |
+|---|---|---|---|
+| `server.listen` | `0.0.0.0:8787` | `PROXY_SERVER_LISTEN` | 监听地址；`0.0.0.0` 对局域网开放 |
+| `upstream.base_url` | `http://127.0.0.1:8000/v1` | `PROXY_UPSTREAM_BASE_URL` | completions 路径之前的部分 |
+| `upstream.path` | `/chat/completions` | `PROXY_UPSTREAM_PATH` | 拼接在 `base_url` 后；legacy 后端设为 `/completions` |
+| `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | 最大在途请求数；超出排队（背压） |
+| `limits.max_body_bytes` | `67108864` | `PROXY_LIMITS_MAX_BODY_BYTES` | 客户端请求体上限（字节） |
+| `limits.max_sse_line_bytes` | `16777216` | — | 单条 SSE data 行上限（大 tool 参数） |
+| `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
+| `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | 单请求总时长上限（长生成） |
+| `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | keep-alive 空闲连接超时 |
+| `timeouts.stream_write` | `5m` | `PROXY_TIMEOUTS_STREAM_WRITE` | 写慢速流式客户端的最大停滞时间 |
+| `timeouts.header_write` | `60s` | — | 等待客户端请求头超时 |
+| `shutdown.timeout` | `30s` | `PROXY_SHUTDOWN_TIMEOUT` | SIGTERM 后在途请求的宽限期 |
+| `log.format` | `json` | `PROXY_LOG_FORMAT` | `json` 或 `text` |
+| `log.level` | `info` | `PROXY_LOG_LEVEL` | `debug`/`info`/`warn`/`error` |
+
+不启动服务即可校验配置：
+
+```bash
+protocol-proxy check-config --config config.yaml
+```
+
+配置非法时以非零码退出，并精确指出字段与期望值。
+
+## Docker
+
+Multi-stage 构建，最终镜像为 **distroless/static**（无 shell、无包管理器、
+含 CA 证书），以 `nonroot` 用户运行：
+
+```bash
+docker build -t protocol-proxy .
+
+docker run --rm -p 8787:8787 \
+  -v "$PWD/config.example.yaml:/etc/protocol-proxy/config.yaml:ro" \
+  protocol-proxy
+```
+
+受限网络下用 Go 模块镜像构建：
+
+```bash
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t protocol-proxy .
+```
+
+镜像内置 `HEALTHCHECK`，由二进制自带的 `healthcheck` 子命令实现
+（distroless 没有 curl）：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD ["/protocol-proxy", "healthcheck"]
+```
+
+### Docker Compose——upstream 在宿主机
+
+```yaml
+services:
+  protocol-proxy:
+    image: protocol-proxy:latest
+    build: .
+    ports: ["8787:8787"]
+    environment:
+      PROXY_UPSTREAM_BASE_URL: "http://host.docker.internal:8000/v1"
+    restart: unless-stopped
+    stop_grace_period: 35s   # 必须大于 shutdown.timeout，SIGTERM 才能完整 drain
+```
+
+### Docker Compose——全部容器化
+
+参见 [`docker-compose.example.yml`](docker-compose.example.yml)；代理通过
+compose 网络内的服务名访问 provider：
+
+```yaml
+PROXY_UPSTREAM_BASE_URL: "http://llm-provider:8000/v1"
+```
+
+upstream 地址速查：
+
+| Upstream 位置 | `upstream.base_url` |
+|---|---|
+| 同宿主机，代理跑裸机 | `http://127.0.0.1:8000/v1` |
+| 同宿主机，代理在 Docker（Linux） | `http://172.17.0.1:8000/v1`，或 `--add-host=host.docker.internal:host-gateway` |
+| 同宿主机，代理在 Docker（macOS/Windows） | `http://host.docker.internal:8000/v1` |
+| 同 compose 网络的另一个容器 | `http://llm-provider:8000/v1` |
+| 远程机器 | `http://10.1.2.3:8000/v1` |
+
+SIGTERM 时，Docker 的 `stop_grace_period`（保持大于
+`shutdown.timeout`）让在途流 drain；readiness 立即变 503，drain 完成后
+进程以 0 退出。
+
+## systemd
+
+```bash
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin protocol-proxy || true
+sudo install -Dm755 protocol-proxy /usr/local/bin/protocol-proxy
+sudo install -Dm644 config.example.yaml /etc/protocol-proxy/config.yaml
+sudo cp deploy/systemd/protocol-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now protocol-proxy
+
+journalctl -u protocol-proxy -f        # journald 中的结构化 JSON 日志
+sudo systemctl restart protocol-proxy  # 先 drain 再重启
+```
+
+unit 以专用非 root 系统用户运行，故障自动重启，SIGTERM 有 35 秒 drain
+时间。
+
+## 局域网部署
+
+```
+开发机 A（LLM + 代理）                     开发机 B（Codex）
+  protocol-proxy :8787   <------ 局域网 ---->  base_url http://A:8787/v1
+```
+
+1. A 上设 `server.listen: "0.0.0.0:8787"`，启动代理。
+2. 开放端口：
+
+```bash
+sudo firewall-cmd --add-port=8787/tcp --permanent && sudo firewall-cmd --reload   # firewalld
+sudo ufw allow 8787/tcp                                                          # ufw
+sudo iptables -A INPUT -p tcp --dport 8787 -j ACCEPT                             # iptables
+```
+
+3. B 上的客户端指向 `http://<A的局域网IP>:8787/v1`。
+
+## Codex 配置
+
+Codex 认为自己连的是真正的 Responses API，适配器在内部完成翻译。你的
+API Key 管理方式完全不变——Codex 发出的 `Authorization` header 原样转发
+到 upstream。
+
+```toml
+model = "your-model"
+model_provider = "protocol-proxy"
+
+[model_providers.protocol-proxy]
+name = "Custom Completions Provider"
+base_url = "http://192.168.1.100:8787/v1"
+wire_api = "responses"
+```
+
+## curl 示例
+
+非流式：
+
+```bash
+curl http://127.0.0.1:8787/v1/responses \
+  -H "Authorization: Bearer $UPSTREAM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model","input":"Explain backpressure in one sentence."}'
+```
+
+流式：
+
+```bash
+curl -N http://127.0.0.1:8787/v1/responses \
+  -H "Authorization: Bearer $UPSTREAM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model","input":"Count from 1 to 5.","stream":true}'
+```
+
+Tool-call 多轮：
+
+```bash
+# 第 1 轮：模型请求调用工具
+curl http://127.0.0.1:8787/v1/responses -H "Authorization: Bearer $K" -d '{
+  "model":"your-model",
+  "input":"What is the weather in Tokyo?",
+  "tools":[{"type":"function","name":"get_weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]
+}'
+# → output 含 {"type":"function_call","call_id":"...","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}
+
+# 第 2 轮：把调用与工具结果回传
+curl http://127.0.0.1:8787/v1/responses -H "Authorization: Bearer $K" -d '{
+  "model":"your-model",
+  "input":[
+    {"type":"message","role":"user","content":"What is the weather in Tokyo?"},
+    {"type":"function_call","call_id":"call_abc","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"},
+    {"type":"function_call_output","call_id":"call_abc","output":"{\"temp_c\":18,\"sky\":\"cloudy\"}"}
+  ],
+  "tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]
+}'
+```
+
+## Health / Ready / Metrics
+
+```bash
+curl http://127.0.0.1:8787/health   # 200 {"status":"ok"}     存活
+curl http://127.0.0.1:8787/ready    # 200 {"status":"ready"}  就绪（shutdown 期间 503）
+curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
+```
+
+指标（全部低基数；绝不包含 header、凭据或 prompt 内容）：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `protocol_proxy_requests_total` | counter | 收到的请求 |
+| `protocol_proxy_responses_total` | counter | 发出的响应 |
+| `protocol_proxy_errors_total{type}` | counter | 代理侧错误 |
+| `protocol_proxy_upstream_errors_total{class}` | counter | upstream 失败 |
+| `protocol_proxy_streaming_requests_total` | counter | 开始的 SSE 流 |
+| `protocol_proxy_tool_calls_total` | counter | 输出中观察到的 tool call |
+| `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | 出入 body 字节 |
+| `protocol_proxy_upstream_requests_total` | counter | 发起的 upstream 调用 |
+| `protocol_proxy_active_connections` / `_active_requests` | gauge | 活跃连接 / 在途请求 |
+| `protocol_proxy_request_duration_seconds` | histogram | 端到端延迟 |
+| `protocol_proxy_upstream_duration_seconds` | histogram | 到 upstream 响应头的时间 |
+| `protocol_proxy_first_byte_latency_seconds` | histogram | 请求开始 → 首个 SSE 事件 flush |
+
+日志为结构化 JSON（slog）：`timestamp`、`level`、`request_id`、
+`method`、`path`、`status`、`bytes_out`、`latency_ms`。代理**从不**记录
+`Authorization` header、API Key、prompt 或 body——代码里根本不存在这样
+的路径。
+
+## 性能
+
+转换层微基准（`make bench`，i7-14650HX）：
+
+```
+BenchmarkConvertRequest-16     2612932    897.9 ns/op
+BenchmarkConvertResponse-16   11060269    210.9 ns/op
+BenchmarkStreamer-16             82387  29467 ns/op   # 约 203-chunk 的流 ≈ 145 ns/chunk
+```
+
+单请求 CPU 开销远低于 1 毫秒、每流式 chunk 约 150 ns——100+ 并发流下
+代理层不构成瓶颈。
+
+对运行中的实例压测：
+
+```bash
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s
+go run ./tests/load -url http://127.0.0.1:8787/v1/responses -concurrency 100 -duration 30s -stream
+```
+
+输出 req/s、错误数、吞吐、延迟 p50/p95/p99，流式模式下另有首个 SSE
+事件延迟分位数。
+
+```bash
+make test    # 单元 + e2e 测试
+make race    # 同上，开启 race detector
+```
+
+测试覆盖：转换器表驱动用例、逐字节喂入的 SSE 拆分解析、UTF-8 拆分
+边界、并行 tool call 的流式事件序列、Authorization 透传、客户端断开的
+取消传导、upstream 错误转发、shutdown 时 readiness 翻转、10/50/100/200
+并发。
+
+## 故障排查
+
+| 现象 | 可能原因 / 处理 |
+|---|---|
+| `400 previous_response_id is not supported` | 客户端依赖服务端会话状态；把完整历史放进 `input`（Codex 默认如此）。 |
+| `502 ... connection refused` | provider 不可达；检查 `upstream.base_url`。Docker 访问宿主机用 `host.docker.internal`（Linux 需 `--add-host`）。 |
+| SSE 不流式 / 被缓冲 | 前置反向代理缓冲了（nginx）；设 `proxy_buffering off;`（适配器已发送 `X-Accel-Buffering: no`）。 |
+| `400 unsupported input item type` | 客户端发送了 chat-completions 无对应的 item 类型（如 `computer_call`）。 |
+| 流恰好在 5 分钟处被切断 | 慢客户端触发 `timeouts.stream_write`；合理场景可调大。 |
+| 客户端解析不到 tool call | provider 必须以 `delta.tool_calls[].index` 形式输出（标准 OpenAI 形状）；检查 provider 是否启用 tools。 |
+
+## 安全说明
+
+> **不要把本适配器直接暴露到公网。**
+
+它**不做任何认证**，客户端发什么 `Authorization` 就转发什么——这是设计
+使然。任何能访问端口的人都能消耗你 upstream 的配额。预期部署位置：
+
+```
+Internet  ✗  （绝不直连）
+可信局域网 / tailnet / VPN  →  synapse-protocol-adapter  →  LLM provider
+```
+
+如果必须暴露到可信网络之外，请在前面加认证层（mTLS、OAuth2-proxy、
+Cloudflare Access、Tailscale Funnel……）或自行添加认证 middleware——
+middleware 层是独立隔离的，加一个文件即可。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 dncore

@@ -1,0 +1,17 @@
+# Local compose file: run against an upstream on the docker host.
+# For a fully-containerized stack see docker-compose.example.yml.
+services:
+  protocol-proxy:
+    image: protocol-proxy:latest
+    build: .
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.example.yaml:/etc/protocol-proxy/config.yaml:ro
+    # Reach a provider on the host itself:
+    #   Linux:   http://172.17.0.1:8000/v1 or http://host.docker.internal:8000/v1
+    #   macOS/Windows: http://host.docker.internal:8000/v1
+    environment:
+      PROXY_UPSTREAM_BASE_URL: "http://host.docker.internal:8000/v1"
+    restart: unless-stopped
+    stop_grace_period: 35s   # > shutdown.timeout so SIGTERM drains fully

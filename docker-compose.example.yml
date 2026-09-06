@@ -1,0 +1,28 @@
+# Fully containerized stack: proxy + upstream on one Docker network.
+# Copy to docker-compose.yml and adjust the upstream service.
+services:
+  protocol-proxy:
+    image: protocol-proxy:latest
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      PROXY_SERVER_LISTEN: "0.0.0.0:8787"
+      # Docker DNS resolves the service name inside the network.
+      PROXY_UPSTREAM_BASE_URL: "http://llm-provider:8000/v1"
+    restart: unless-stopped
+    stop_grace_period: 35s
+    depends_on:
+      llm-provider:
+        condition: service_started
+
+  # Placeholder: replace with your real provider image (vLLM, SGLang,
+  # llama.cpp server, ...). It must expose OpenAI-compatible
+  # POST /v1/chat/completions.
+  llm-provider:
+    image: ghcr.io/example/your-llm-provider:latest
+    # volumes:
+    #   - ./models:/models:ro
+    # command: ["--model", "/models/model.gguf", "--port", "8000"]
+    ports:
+      - "8000:8000"

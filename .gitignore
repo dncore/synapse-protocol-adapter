@@ -1,0 +1,9 @@
+# local artifacts
+protocol-proxy
+synapse-protocol-adapter
+*.log
+config.local.yaml
+
+# editor / agent dirs must never be published
+.claude/
+.remember/
