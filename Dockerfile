@@ -18,7 +18,7 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/synapse ./cmd/proxy
+    -o /out/synapse ./cmd/synapse
 
 # ---- runtime stage ----
 # distroless/static: no shell, no package manager, CA certs included,
