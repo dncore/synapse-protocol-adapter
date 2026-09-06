@@ -111,8 +111,16 @@ distribution):
 
 ```bash
 npm install -g @dncore/synapse
-synapse --config config.example.yaml
+synapse init                    # writes the annotated ~/.config/synapse/config.yaml
+$EDITOR ~/.config/synapse/config.yaml   # set upstream.base_url
+synapse service install --now   # systemd user unit / launchd agent, autostart
+synapse status                  # service state + /health /ready + version
 ```
+
+`service install` bakes the npm-resolved binary path into a generated
+unit file, so no hand-written unit with guessed paths. For a one-off
+foreground run instead: `synapse --config <path>`. See
+[`synapse --help`](cmd/synapse/main.go) for the full command surface.
 
 Or grab a release binary directly:
 
@@ -408,6 +416,13 @@ immediately, the process exits 0 when drained.
 
 ## systemd
 
+Installed via npm, or without root? Skip this block — `synapse init &&
+synapse service install --now` generates a **user** unit
+(`~/.config/systemd/user/synapse.service`) with the resolved binary
+path, enables linger for boot autostart, and the same lifecycle
+(`synapse start|stop|restart|status`, `journalctl --user -u synapse -f`).
+The root setup below is for system-wide installs:
+
 ```bash
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin synapse || true
 sudo install -Dm755 synapse /usr/local/bin/synapse
@@ -425,8 +440,12 @@ and gives SIGTERM 35 s to drain.
 
 ## macOS (launchd)
 
-The native always-on mechanism on macOS is launchd; the repo ships a
-ready LaunchAgent at [`deploy/launchd/`](deploy/launchd/).
+The native always-on mechanism on macOS is launchd. npm users can skip
+the manual steps: `synapse init && synapse service install --now`
+generates `~/Library/LaunchAgents/com.synapse.proxy.plist` with the
+resolved paths (logs at `~/Library/Logs/synapse.log`). The repo also
+ships a ready LaunchAgent at [`deploy/launchd/`](deploy/launchd/) for
+release-binary installs:
 
 **1. Cross-compile** (from any machine; pure Go, no CGO — Intel Macs use
 `DARWIN_ARCH=amd64`):

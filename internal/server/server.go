@@ -30,7 +30,8 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
 
-// Version is set at build time via -ldflags "-X ...server.Version=...".
+// Version is stamped from main.version at startup (main gets the build
+// version via -ldflags "-X main.version=...").
 var Version = "dev"
 
 // Server owns the HTTP server lifecycle.

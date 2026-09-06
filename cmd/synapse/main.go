@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,26 +21,69 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 	"github.com/dncore/synapse-protocol-adapter/internal/server"
+	"github.com/dncore/synapse-protocol-adapter/internal/service"
 )
 
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "check-config" {
-		if err := runCheckConfig(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "config check failed: %v\n", err)
-			os.Exit(1)
+	if len(os.Args) > 1 {
+		switch sub := os.Args[1]; sub {
+		case "check-config":
+			if err := runCheckConfig(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "config check failed: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("config OK")
+			return
+		case "healthcheck":
+			if err := runHealthcheck(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "init":
+			if err := runInit(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "init failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "start", "stop", "restart":
+			var err error
+			switch sub {
+			case "start":
+				err = service.Start()
+			case "stop":
+				err = service.Stop()
+			case "restart":
+				err = service.Restart()
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s failed: %v\n(is the service installed? `synapse service install`)\n", sub, err)
+				os.Exit(1)
+			}
+			return
+		case "status":
+			if err := runStatus(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "status failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "service":
+			if err := runService(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "service failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "-h", "--help", "help":
+			usage()
+			return
 		}
-		fmt.Println("config OK")
-		return
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		if err := runHealthcheck(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
-			os.Exit(1)
+		if !strings.HasPrefix(os.Args[1], "-") {
+			fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+			usage()
+			os.Exit(2)
 		}
-		return
 	}
 
 	fs := flag.NewFlagSet("synapse", flag.ContinueOnError)
@@ -60,6 +105,7 @@ func main() {
 
 	logger := newLogger(cfg.Log)
 	reg := metrics.NewRegistry()
+	server.Version = version // surface the build version on GET /version
 
 	srv := server.New(cfg, logger, reg)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -69,6 +115,94 @@ func main() {
 		logger.Error("server exited", "err", err.Error())
 		os.Exit(1)
 	}
+}
+
+// usage prints the command surface. Service subcommands target the
+// daemon installed via `synapse service install`.
+func usage() {
+	fmt.Print(`synapse — OpenAI Responses API to Chat Completions protocol adapter
+
+Usage:
+  synapse [--config PATH]              run in the foreground
+  synapse init [--config PATH]         write the annotated default config
+  synapse start | stop | restart       control the installed service
+  synapse status [--config PATH]       service state + health + version
+  synapse service install [--config PATH] [--now]
+                                       install as an autostart service
+                                       (systemd user unit / launchd agent)
+  synapse service uninstall            remove the service (keeps config)
+  synapse check-config [--config PATH] validate a config and exit
+  synapse healthcheck [--url URL]      probe a running daemon (Docker HEALTHCHECK)
+  synapse --version                    print version and exit
+
+The default config path for service commands is
+~/.config/synapse/config.yaml (see ` + "`synapse init`" + `). Every setting can
+also be set via PROXY_* environment variables.
+`)
+}
+
+// defaultServiceConfig resolves the config path service commands use
+// when --config is not given.
+func defaultServiceConfig() string {
+	p, err := service.DetectPaths(runtime.GOOS)
+	if err != nil {
+		return "" // unsupported platform; commands will report the error
+	}
+	return p.Config
+}
+
+// runInit writes the annotated example config if not already present.
+func runInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	configPath := fs.String("config", defaultServiceConfig(), "config file to create")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := os.Stat(*configPath); err == nil {
+		return fmt.Errorf("%s already exists — edit it, or `synapse check-config --config %s` to validate", *configPath, *configPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(*configPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(*configPath, []byte(config.ExampleConfig), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\n\nnext steps:\n  1. edit it (upstream.base_url at minimum)\n  2. synapse check-config --config %s\n  3. synapse service install --now\n  4. synapse status\n", *configPath, *configPath)
+	return nil
+}
+
+// runStatus prints the service/health summary.
+func runStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	configPath := fs.String("config", defaultServiceConfig(), "config file the service runs with")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return service.Status(*configPath)
+}
+
+// runService dispatches `synapse service install|uninstall`.
+func runService(args []string) error {
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "install":
+		fs := flag.NewFlagSet("service install", flag.ContinueOnError)
+		configPath := fs.String("config", "", "config file (default: `synapse init` location)")
+		now := fs.Bool("now", false, "start immediately after installing")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return service.Install(*configPath, *now)
+	case "uninstall":
+		return service.Uninstall()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown service subcommand %q (want install|uninstall)\n", args[0])
+		os.Exit(2)
+	}
+	return nil
 }
 
 // runCheckConfig loads and validates a config without starting the server.

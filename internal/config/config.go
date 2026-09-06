@@ -5,6 +5,7 @@
 package config
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,6 +16,13 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// ExampleConfig is the fully annotated default configuration, served by
+// `synapse init` so users get a self-documenting starting point. The
+// repo-root config.example.yaml symlinks here (single source).
+//
+//go:embed example.yaml
+var ExampleConfig string
 
 // Config is the full proxy configuration tree.
 type Config struct {

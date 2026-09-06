@@ -104,8 +104,15 @@ npm（预编译二进制，Node 只是启动器——esbuild 式分发）：
 
 ```bash
 npm install -g @dncore/synapse
-synapse --config config.example.yaml
+synapse init                    # 生成带注释的 ~/.config/synapse/config.yaml
+$EDITOR ~/.config/synapse/config.yaml   # 至少改好 upstream.base_url
+synapse service install --now   # 生成 systemd 用户服务 / launchd agent，开机自启
+synapse status                  # 服务状态 + /health /ready + 版本，一屏汇总
 ```
+
+`service install` 会把 npm 解析出的真实二进制路径写入生成的 unit
+文件，无需手写 unit 猜路径。临时前台运行用 `synapse --config <path>`。
+完整命令面见 `synapse --help`。
 
 或直接下载 Release 二进制：
 
@@ -390,6 +397,13 @@ SIGTERM 时，Docker 的 `stop_grace_period`（保持大于
 
 ## systemd
 
+npm 安装或无 root 权限？直接跳过本节——`synapse init && synapse
+service install --now` 会生成**用户级** unit
+（`~/.config/systemd/user/synapse.service`，内嵌解析后的二进制路径），
+并启用 linger 实现开机自启；生命周期用 `synapse start|stop|restart|
+status` 与 `journalctl --user -u synapse -f` 管理。下面的 root 流程
+面向系统级安装：
+
 ```bash
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin synapse || true
 sudo install -Dm755 synapse /usr/local/bin/synapse
@@ -407,7 +421,11 @@ unit 以专用非 root 系统用户运行，故障自动重启，SIGTERM 有 35 
 
 ## macOS（launchd）
 
-macOS 原生的常驻机制是 launchd；仓库自带 LaunchAgent 模板：
+macOS 原生的常驻机制是 launchd。npm 用户可跳过手工步骤：`synapse
+init && synapse service install --now` 直接生成带解析路径的
+`~/Library/LaunchAgents/com.synapse.proxy.plist`（日志在
+`~/Library/Logs/synapse.log`）。Release 二进制用户可用仓库自带的
+LaunchAgent 模板：
 [`deploy/launchd/`](deploy/launchd/)。
 
 **1. 交叉编译**（任意机器可编；纯 Go 无 CGO。Intel Mac 用
