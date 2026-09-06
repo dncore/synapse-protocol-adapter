@@ -415,14 +415,22 @@ func (s *Server) forwardUpstreamError(w http.ResponseWriter, resp *http.Response
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// writeProxyError emits a Responses-shaped error produced by the proxy itself.
+// writeProxyError emits a Responses-shaped error produced by the proxy
+// itself, with OpenAI-conventional error type values.
 func (s *Server) writeProxyError(w http.ResponseWriter, status int, msg string) {
+	errType := "server_error"
+	switch {
+	case status >= 400 && status < 500:
+		errType = "invalid_request_error"
+	case status == http.StatusBadGateway || status == http.StatusGatewayTimeout:
+		errType = "upstream_error"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
 			"message": msg,
-			"type":    "proxy_error",
+			"type":    errType,
 			"code":    strconv.Itoa(status),
 		},
 	})

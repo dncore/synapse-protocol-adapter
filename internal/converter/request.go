@@ -33,11 +33,17 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 		Tools:             convertTools(req.Tools),
 		ToolChoice:        convertToolChoice(req.ToolChoice),
 		Temperature:       req.Temperature,
-		TopP:              req.TopP,
-		MaxTokens:         req.MaxOutputTokens,
-		Stream:            req.Stream,
-		ParallelToolCalls: req.ParallelToolCalls,
-		User:              req.User,
+		TopP:               req.TopP,
+		MaxTokens:          req.MaxOutputTokens,
+		Stream:             req.Stream,
+		ParallelToolCalls:  req.ParallelToolCalls,
+		User:               req.User,
+	}
+	// Responses reasoning effort has a direct chat equivalent on providers
+	// that support it (OpenAI reasoning_effort, Gemini thinking budget
+	// bridges); providers without it ignore unknown fields.
+	if req.Reasoning != nil && req.Reasoning.Effort != "" {
+		out.ReasoningEffort = req.Reasoning.Effort
 	}
 	if req.Stream {
 		out.StreamOptions = &completions.StreamOptions{IncludeUsage: true}
@@ -51,18 +57,24 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 }
 
 // convertMessages builds the chat message list from instructions + input.
+// The legacy `prompt` field is honored as a fallback when `input` is empty.
 func convertMessages(req *responses.Request) ([]completions.Message, error) {
+	input := req.Input
+	if input.String == "" && len(input.Items) == 0 {
+		input = req.Prompt
+	}
+
 	var msgs []completions.Message
 
 	hasSystem := false
-	if req.Input.String != "" {
+	if input.String != "" {
 		msgs = append(msgs, completions.Message{
 			Role:    "user",
-			Content: completions.MessageContent{String: req.Input.String},
+			Content: completions.MessageContent{String: input.String},
 		})
 	} else {
-		for i := range req.Input.Items {
-			item := &req.Input.Items[i]
+		for i := range input.Items {
+			item := &input.Items[i]
 			switch item.Type {
 			case "message":
 				m, err := convertMessageItem(item)
@@ -74,22 +86,33 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 				}
 				msgs = append(msgs, m)
 			case "function_call":
-				msgs = append(msgs, completions.Message{
-					Role: "assistant",
-					ToolCalls: []completions.ToolCall{{
-						ID:   item.CallID,
-						Type: "function",
-						Function: completions.FuncCall{
-							Name:      item.Name,
-							Arguments: item.Arguments,
-						},
-					}},
-				})
+				call := completions.ToolCall{
+					// Some clients put the id only in `id` when replaying
+					// history; accept either key.
+					ID:   orEmpty(item.CallID, item.ID),
+					Type: "function",
+					Function: completions.FuncCall{
+						Name:      item.Name,
+						Arguments: item.Arguments,
+					},
+				}
+				// Merge into the previous assistant message when the client
+				// replayed parallel calls as consecutive items: chat
+				// semantics are ONE assistant message with N tool_calls,
+				// and several providers reject back-to-back assistant turns.
+				if n := len(msgs); n > 0 && msgs[n-1].Role == "assistant" {
+					msgs[n-1].ToolCalls = append(msgs[n-1].ToolCalls, call)
+				} else {
+					msgs = append(msgs, completions.Message{
+						Role:      "assistant",
+						ToolCalls: []completions.ToolCall{call},
+					})
+				}
 			case "function_call_output":
 				msgs = append(msgs, completions.Message{
 					Role:       "tool",
 					ToolCallID: item.CallID,
-					Content:    completions.MessageContent{String: item.Output},
+					Content:    toolOutputContent(item.Output),
 				})
 			case "reasoning":
 				// Reasoning items carry no chat-completions equivalent and
@@ -118,8 +141,14 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 // message, mapping content part types.
 func convertMessageItem(item *responses.Item) (completions.Message, error) {
 	role := item.Role
-	if role != "system" && role != "developer" && role != "user" && role != "assistant" && role != "tool" {
-		return completions.Message{}, fmt.Errorf("unsupported message role %q", role)
+	switch role {
+	case "developer":
+		// OpenAI chat treats developer≈system; many OpenAI-compatible
+		// backends only accept "system", and nothing is lost by unifying.
+		role = "system"
+	case "system", "user", "assistant", "tool":
+	default:
+		return completions.Message{}, fmt.Errorf("unsupported message role %q", item.Role)
 	}
 
 	m := completions.Message{Role: role}
@@ -129,8 +158,12 @@ func convertMessageItem(item *responses.Item) (completions.Message, error) {
 		parts := make([]completions.ContentPart, 0, len(item.Content.Parts))
 		for _, p := range item.Content.Parts {
 			switch p.Type {
-			case "input_text", "output_text", "summary_text", "refusal":
+			case "input_text", "output_text", "summary_text":
 				parts = append(parts, completions.ContentPart{Type: "text", Text: p.Text})
+			case "refusal":
+				// Prior refusals replayed as conversation history: surface
+				// the refusal text as plain text for chat backends.
+				parts = append(parts, completions.ContentPart{Type: "text", Text: p.Refusal})
 			case "input_image":
 				parts = append(parts, completions.ContentPart{
 					Type:     "image_url",
@@ -143,6 +176,31 @@ func convertMessageItem(item *responses.Item) (completions.Message, error) {
 		m.Content = completions.MessageContent{Parts: parts}
 	}
 	return m, nil
+}
+
+// toolOutputContent flattens a tool output (string or typed parts) into a
+// chat tool-message content. String outputs pass through verbatim; part
+// arrays are joined as their text/image-url parts.
+func toolOutputContent(out responses.OutputContent) completions.MessageContent {
+	if out.Parts == nil {
+		return completions.MessageContent{String: out.String}
+	}
+	parts := make([]completions.ContentPart, 0, len(out.Parts))
+	for _, p := range out.Parts {
+		switch p.Type {
+		case "input_image", "output_image", "image_url":
+			parts = append(parts, completions.ContentPart{
+				Type:     "image_url",
+				ImageURL: &completions.ImageURL{URL: p.ImageURL},
+			})
+		default: // output_text and anything text-like
+			parts = append(parts, completions.ContentPart{Type: "text", Text: p.Text})
+		}
+	}
+	if len(parts) == 0 {
+		return completions.MessageContent{String: ""}
+	}
+	return completions.MessageContent{Parts: parts}
 }
 
 // convertTools maps flattened Responses tool definitions to the nested chat
@@ -162,7 +220,7 @@ func convertTools(tools []responses.Tool) []completions.Tool {
 			Function: completions.Function{
 				Name:        t.Name,
 				Description: t.Description,
-				Parameters:  t.Parameters,
+				Parameters:  withObjectType(t.Parameters),
 				Strict:      t.Strict,
 			},
 		})
@@ -173,9 +231,42 @@ func convertTools(tools []responses.Tool) []completions.Tool {
 	return out
 }
 
-// convertToolChoice normalizes tool_choice between the two shapes. String
-// forms ("auto", "none", "required") pass through; the object form
-// {"type":"function","name":...} becomes {"type":"function","function":{"name":...}}.
+// withObjectType ensures a JSON-schema parameters blob carries the
+// top-level "type":"object" several providers require; a missing or empty
+// schema gets a minimal one.
+func withObjectType(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return json.RawMessage(`{"type":"object"}`)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw // not an object schema; pass through untouched
+	}
+	if _, ok := m["type"]; !ok {
+		m["type"] = json.RawMessage(`"object"`)
+		if out, err := json.Marshal(m); err == nil {
+			return out
+		}
+	}
+	return raw
+}
+
+func orEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// convertToolChoice normalizes tool_choice between the two shapes.
+// String forms ("auto", "none", "required") pass through. Object forms
+// seen in the wild:
+//   - {"type":"function","name":...}             (Responses flattened)
+//   - {"type":"function","function":{"name":…}}  (chat shape echoed back)
+//   - {"type":"auto"|"none"|"required"|"tool"}    (Cursor IDE style)
+//
+// Notably {"type":"none"} must NOT degrade to "auto": that would re-enable
+// the tools the client explicitly disabled.
 func convertToolChoice(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
@@ -194,28 +285,38 @@ func convertToolChoice(raw json.RawMessage) json.RawMessage {
 		Function *struct {
 			Name string `json:"name"`
 		} `json:"function"`
-		Name string `json:"name"` // Responses flattened form
+		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return json.RawMessage(`"auto"`)
 	}
-	if obj.Type != "function" {
-		return json.RawMessage(`"auto"`)
+
+	switch obj.Type {
+	case "auto", "none":
+		return json.RawMessage(`"` + obj.Type + `"`)
+	case "required", "tool", "any":
+		// "tool"/"any" without a function name mean "use some tool".
+		return json.RawMessage(`"required"`)
+	case "function":
+		name := obj.Name
+		if obj.Function != nil {
+			name = obj.Function.Name
+		}
+		if name == "" {
+			return json.RawMessage(`"required"`)
+		}
+		out, err := json.Marshal(map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+			},
+		})
+		if err != nil {
+			return json.RawMessage(`"auto"`)
+		}
+		return out
 	}
-	name := obj.Name
-	if obj.Function != nil {
-		name = obj.Function.Name
-	}
-	if name == "" {
-		return json.RawMessage(`"auto"`)
-	}
-	out, _ := json.Marshal(map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name": name,
-		},
-	})
-	return out
+	return json.RawMessage(`"auto"`)
 }
 
 // convertResponseFormat resolves the effective response format from either

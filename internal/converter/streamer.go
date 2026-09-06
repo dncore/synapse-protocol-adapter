@@ -1,6 +1,8 @@
 package converter
 
 import (
+	"fmt"
+
 	"github.com/dncore/synapse-protocol-adapter/internal/completions"
 	"github.com/dncore/synapse-protocol-adapter/internal/responses"
 )
@@ -24,10 +26,17 @@ type Streamer struct {
 	created  int64
 	model    string
 
+	// Reasoning output state (DeepSeek-style reasoning_content).
+	reasoningOpen    bool
+	reasoningItemID  string
+	reasoningBuf     []byte
+	reasoningOutIdx  int
+
 	// Text output state.
 	textItemOpen  bool
 	textItemID    string
 	textBuf       []byte
+	refusalBuf    []byte
 	textOutputIdx int
 	outputIndex   int // next output index to assign
 
@@ -36,7 +45,9 @@ type Streamer struct {
 
 	usage    *completions.Usage
 	finished bool
-	final    *responses.Response
+	// finishReason as reported upstream; drives completed vs incomplete.
+	finishReason string
+	final        *responses.Response
 }
 
 type toolState struct {
@@ -117,6 +128,44 @@ func (s *Streamer) skeleton() *responses.Response {
 func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 	var events []*responses.Event
 
+	if r := reasoningDelta(ch.Delta); r != "" {
+		if !s.reasoningOpen {
+			s.reasoningOpen = true
+			s.reasoningItemID = "rs_" + s.respID
+			s.reasoningOutIdx = s.outputIndex
+			s.outputIndex++
+			events = append(events,
+				&responses.Event{
+					Type: "response.output_item.added", SequenceNumber: s.nextSeq(),
+					OutputIndex: s.reasoningOutIdx,
+					Item: &responses.Item{
+						Type: "reasoning", ID: s.reasoningItemID, Status: "in_progress",
+						Summary: []responses.ContentPart{},
+					},
+				},
+				&responses.Event{
+					Type: "response.reasoning_summary_part.added", SequenceNumber: s.nextSeq(),
+					ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
+					Item: &responses.Item{Type: "reasoning_summary_part", ID: s.reasoningItemID, Status: "in_progress"},
+				},
+			)
+		}
+		s.reasoningBuf = append(s.reasoningBuf, r...)
+		events = append(events, &responses.Event{
+			Type: "response.reasoning_summary_text.delta", SequenceNumber: s.nextSeq(),
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
+			Delta: r,
+		})
+	}
+
+	// Close the reasoning item as soon as anything else arrives — OpenAI's
+	// native streams close reasoning before the message/tool items open,
+	// and clients key on that ordering.
+	if s.reasoningOpen && (ch.Delta.Content != "" || ch.Delta.Refusal != "" ||
+		len(ch.Delta.ToolCalls) > 0 || (ch.FinishReason != nil && *ch.FinishReason != "")) {
+		events = append(events, s.closeReasoning()...)
+	}
+
 	if ch.Delta.Content != "" {
 		if !s.textItemOpen {
 			s.textItemOpen = true
@@ -161,7 +210,9 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 		}
 		st, ok := s.tools[idx]
 		if !ok {
-			st = &toolState{itemID: "fc_" + s.respID}
+			// Item IDs must be unique per call: parallel calls sharing one
+			// id break clients that key items by id.
+			st = &toolState{itemID: fmt.Sprintf("fc_%s_%d", s.respID, idx)}
 			s.tools[idx] = st
 		}
 		if tc.ID != "" {
@@ -193,7 +244,33 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 		}
 	}
 
+	if ch.Delta.Refusal != "" {
+		// Upstream refusals stream as refusal deltas; surface them through
+		// the message part so the terminal event carries them.
+		if !s.textItemOpen {
+			s.textItemOpen = true
+			s.textItemID = "msg_" + s.respID
+			s.textOutputIdx = s.outputIndex
+			s.outputIndex++
+			events = append(events, &responses.Event{
+				Type: "response.output_item.added", SequenceNumber: s.nextSeq(),
+				OutputIndex: s.textOutputIdx,
+				Item: &responses.Item{
+					Type: "message", ID: s.textItemID, Status: "in_progress", Role: "assistant",
+					Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: ""}}},
+				},
+			})
+		}
+		s.refusalBuf = append(s.refusalBuf, ch.Delta.Refusal...)
+		events = append(events, &responses.Event{
+			Type: "response.refusal.delta", SequenceNumber: s.nextSeq(),
+			ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0,
+			Delta: ch.Delta.Refusal,
+		})
+	}
+
 	if ch.FinishReason != nil && *ch.FinishReason != "" && !s.finished {
+		s.finishReason = *ch.FinishReason
 		events = append(events, s.closeOutput(*ch.FinishReason)...)
 		s.finished = true
 	}
@@ -202,24 +279,36 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 }
 
 // closeOutput emits the terminal sequence for all open items, in output
-// order: text item first (it opened first), then tool calls ordered by
-// their chat delta index.
+// order: reasoning first (if still open), then text, then tool calls
+// ordered by their chat delta index.
 func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 	var events []*responses.Event
 
+	events = append(events, s.closeReasoning()...)
+
 	if s.textItemOpen {
 		text := string(s.textBuf)
-		events = append(events,
-			&responses.Event{
+		refusal := string(s.refusalBuf)
+		parts := s.textParts()
+		if text != "" {
+			events = append(events, &responses.Event{
 				Type: "response.output_text.done", SequenceNumber: s.nextSeq(),
 				ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0, Text: text,
-			},
+			})
+		}
+		if refusal != "" {
+			events = append(events, &responses.Event{
+				Type: "response.refusal.done", SequenceNumber: s.nextSeq(),
+				ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0, Refusal: refusal,
+			})
+		}
+		events = append(events,
 			&responses.Event{
 				Type: "response.content_part.done", SequenceNumber: s.nextSeq(),
 				ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0,
 				Item: &responses.Item{
 					Type: "output_text", ID: s.textItemID, Status: "completed", Role: "assistant",
-					Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: text}}},
+					Content: responses.ItemContent{Parts: parts},
 				},
 			},
 			&responses.Event{
@@ -227,7 +316,7 @@ func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 				OutputIndex: s.textOutputIdx,
 				Item: &responses.Item{
 					Type: "message", ID: s.textItemID, Status: "completed", Role: "assistant",
-					Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: text}}},
+					Content: responses.ItemContent{Parts: parts},
 				},
 			},
 		)
@@ -258,10 +347,11 @@ func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 	return events
 }
 
-// Finish emits the final response.completed event carrying the aggregated
-// response object. It must be called after the upstream [DONE] sentinel;
-// if the upstream stream ended without a finish_reason it closes any open
-// items gracefully first.
+// Finish emits the terminal response.completed (or response.incomplete
+// when upstream reported length/content_filter) event carrying the
+// aggregated response object. It must be called after the upstream [DONE]
+// sentinel; if the upstream stream ended without a finish_reason it closes
+// any open items gracefully first.
 func (s *Streamer) Finish() []*responses.Event {
 	var out []*responses.Event
 	if !s.finished {
@@ -270,7 +360,18 @@ func (s *Streamer) Finish() []*responses.Event {
 	}
 
 	resp := s.skeleton()
-	resp.Status = "completed"
+	switch s.finishReason {
+	case "length":
+		resp.Status = "incomplete"
+		resp.IncompleteDetails = &responses.IncompleteDetails{Reason: "max_output_tokens"}
+	case "content_filter":
+		resp.Status = "incomplete"
+		resp.IncompleteDetails = &responses.IncompleteDetails{Reason: "content_filter"}
+	case "refusal":
+		resp.Status = "incomplete"
+	default:
+		resp.Status = "completed"
+	}
 
 	for _, idx := range sortedToolIndexes(s.tools) {
 		st := s.tools[idx]
@@ -279,19 +380,88 @@ func (s *Streamer) Finish() []*responses.Event {
 			Name: st.name, Arguments: st.arguments, Status: "completed",
 		})
 	}
-	if s.textItemOpen || len(s.textBuf) > 0 {
+	if s.textItemOpen || len(s.textBuf) > 0 || len(s.refusalBuf) > 0 {
 		resp.Output = append([]responses.Item{{
 			Type: "message", ID: s.textItemID, Status: "completed", Role: "assistant",
-			Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: string(s.textBuf)}}},
+			Content: responses.ItemContent{Parts: s.textParts()},
+		}}, resp.Output...)
+	}
+	if len(s.reasoningBuf) > 0 {
+		resp.Output = append([]responses.Item{{
+			Type: "reasoning", ID: s.reasoningItemID, Status: "completed",
+			Summary: []responses.ContentPart{{Type: "summary_text", Text: string(s.reasoningBuf)}},
 		}}, resp.Output...)
 	}
 
 	resp.Usage = convertUsage(s.usage)
 	s.final = resp
+
+	eventType := "response.completed"
+	if resp.Status == "incomplete" {
+		eventType = "response.incomplete"
+	}
 	out = append(out, &responses.Event{
-		Type: "response.completed", SequenceNumber: s.nextSeq(), Response: resp,
+		Type: eventType, SequenceNumber: s.nextSeq(), Response: resp,
 	})
 	return out
+}
+
+// closeReasoning emits the terminal sequence for the reasoning item and
+// marks it closed; it is a no-op when reasoning never streamed.
+func (s *Streamer) closeReasoning() []*responses.Event {
+	if !s.reasoningOpen {
+		return nil
+	}
+	s.reasoningOpen = false
+	sum := string(s.reasoningBuf)
+	return []*responses.Event{
+		{
+			Type: "response.reasoning_summary_text.done", SequenceNumber: s.nextSeq(),
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0, Text: sum,
+		},
+		{
+			Type: "response.reasoning_summary_part.done", SequenceNumber: s.nextSeq(),
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
+			Item: &responses.Item{
+				Type: "reasoning_summary_part", ID: s.reasoningItemID, Status: "completed",
+				Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "summary_text", Text: sum}}},
+			},
+		},
+		{
+			Type: "response.output_item.done", SequenceNumber: s.nextSeq(),
+			OutputIndex: s.reasoningOutIdx,
+			Item: &responses.Item{
+				Type: "reasoning", ID: s.reasoningItemID, Status: "completed",
+				Summary: []responses.ContentPart{{Type: "summary_text", Text: sum}},
+			},
+		},
+	}
+}
+
+// textParts assembles the final content parts of the assistant message:
+// output text when present, refusal when present, and a single empty
+// output_text part when neither streamed anything.
+func (s *Streamer) textParts() []responses.ContentPart {
+	parts := make([]responses.ContentPart, 0, 2)
+	if len(s.textBuf) > 0 {
+		parts = append(parts, responses.ContentPart{Type: "output_text", Text: string(s.textBuf)})
+	}
+	if len(s.refusalBuf) > 0 {
+		parts = append(parts, responses.ContentPart{Type: "refusal", Refusal: string(s.refusalBuf)})
+	}
+	if len(parts) == 0 {
+		parts = append(parts, responses.ContentPart{Type: "output_text", Text: ""})
+	}
+	return parts
+}
+
+// reasoningDelta extracts the thinking-trace increment of a chat delta,
+// accepting both spellings providers use.
+func reasoningDelta(d completions.Delta) string {
+	if d.ReasoningContent != "" {
+		return d.ReasoningContent
+	}
+	return d.Reasoning
 }
 
 // FinalResponse returns the aggregated response object emitted by the last

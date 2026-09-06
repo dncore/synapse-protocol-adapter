@@ -22,7 +22,7 @@ func benchRequest(nTools int) *responses.Request {
 			{Type: "message", Role: "system", Content: responses.ItemContent{String: "sys prompt"}},
 			{Type: "message", Role: "user", Content: responses.ItemContent{String: "question"}},
 			{Type: "function_call", CallID: "call_1", Name: "tool_a", Arguments: `{"x":"1"}`},
-			{Type: "function_call_output", CallID: "call_1", Output: `{"ok":true}`},
+			{Type: "function_call_output", CallID: "call_1", Output: responses.OutputContent{String: `{"ok":true}`}},
 		}},
 		Tools: tools,
 	}

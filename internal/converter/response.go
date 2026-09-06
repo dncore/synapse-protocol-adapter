@@ -40,20 +40,39 @@ func ConvertResponse(chat *completions.Response, req *responses.Request) *respon
 	case "content_filter":
 		out.Status = "incomplete"
 		out.IncompleteDetails = &responses.IncompleteDetails{Reason: "content_filter"}
+	case "refusal":
+		// The refusal itself rides in the message content parts; the
+		// overall turn is still reported incomplete, matching upstream
+		// adapters.
+		out.Status = "incomplete"
 	}
 
-	if content := messageText(choice.Message); content != "" {
+	if rc := choice.Message.ReasoningContent; rc != "" {
 		out.Output = append(out.Output, responses.Item{
-			Type:   "message",
-			ID:     "msg_" + chat.ID,
+			Type:   "reasoning",
+			ID:     "rs_" + chat.ID,
 			Status: "completed",
-			Role:   "assistant",
-			Content: responses.ItemContent{
-				Parts: []responses.ContentPart{{
-					Type: "output_text",
-					Text: content,
-				}},
-			},
+			Summary: []responses.ContentPart{{
+				Type: "summary_text",
+				Text: rc,
+			}},
+		})
+	}
+
+	if content := messageText(choice.Message); content != "" || choice.Message.Refusal != "" {
+		parts := []responses.ContentPart{}
+		if content != "" {
+			parts = append(parts, responses.ContentPart{Type: "output_text", Text: content})
+		}
+		if choice.Message.Refusal != "" {
+			parts = append(parts, responses.ContentPart{Type: "refusal", Refusal: choice.Message.Refusal})
+		}
+		out.Output = append(out.Output, responses.Item{
+			Type:    "message",
+			ID:      "msg_" + chat.ID,
+			Status:  "completed",
+			Role:    "assistant",
+			Content: responses.ItemContent{Parts: parts},
 		})
 	}
 
@@ -89,19 +108,28 @@ func messageText(m completions.Message) string {
 	return s
 }
 
-// convertUsage maps chat completions token names to responses token names.
+// convertUsage maps chat completions token names to responses token names,
+// preserving provider-reported cache and reasoning breakdowns.
 func convertUsage(u *completions.Usage) *responses.Usage {
 	if u == nil {
 		return nil
 	}
-	return &responses.Usage{
+	out := &responses.Usage{
 		InputTokens:  u.PromptTokens,
 		OutputTokens: u.CompletionTokens,
 		TotalTokens:  u.TotalTokens,
-		OutputTokensDetails: &responses.OutputTokensDetails{
-			ReasoningTokens: 0,
-		},
 	}
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		out.InputTokensDetails = &responses.InputTokensDetails{
+			CachedTokens: u.PromptTokensDetails.CachedTokens,
+		}
+	}
+	if u.CompletionTokensDetails != nil {
+		out.OutputTokensDetails = &responses.OutputTokensDetails{
+			ReasoningTokens: u.CompletionTokensDetails.ReasoningTokens,
+		}
+	}
+	return out
 }
 
 func boolOrDefault(p *bool, def bool) bool {

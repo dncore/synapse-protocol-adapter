@@ -12,6 +12,7 @@ import (
 type Request struct {
 	Model               string           `json:"model"`
 	Input               Input            `json:"input"`
+	Prompt              Input            `json:"prompt,omitempty"` // legacy alternative to input
 	Instructions        string           `json:"instructions,omitempty"`
 	MaxOutputTokens     *int             `json:"max_output_tokens,omitempty"`
 	Metadata            json.RawMessage  `json:"metadata,omitempty"`
@@ -80,13 +81,40 @@ type Item struct {
 	Role    string        `json:"role,omitempty"`
 	Content ItemContent   `json:"content,omitempty"`
 
+	// reasoning
+	Summary []ContentPart `json:"summary,omitempty"`
+
 	// function_call
 	Name      string `json:"name,omitempty"`
 	CallID    string `json:"call_id,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 
-	// function_call_output
-	Output string `json:"output,omitempty"`
+	// function_call_output: a plain string (Codex) or an array of typed
+	// content parts (newer clients). Both are accepted.
+	Output OutputContent
+}
+
+// OutputContent is tool output: either a JSON string or content parts.
+type OutputContent struct {
+	String string
+	Parts  []ContentPart
+}
+
+func (o OutputContent) MarshalJSON() ([]byte, error) {
+	if o.Parts != nil {
+		return json.Marshal(o.Parts)
+	}
+	return json.Marshal(o.String)
+}
+
+func (o *OutputContent) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		return json.Unmarshal(b, &o.String)
+	}
+	if string(b) == "null" {
+		return nil
+	}
+	return json.Unmarshal(b, &o.Parts)
 }
 
 // ItemContent is message content: a plain string or a list of typed parts.
@@ -110,10 +138,11 @@ func (c *ItemContent) UnmarshalJSON(b []byte) error {
 }
 
 // ContentPart is one typed part of a message: input_text, output_text,
-// input_image, summary_text, ...
+// input_image, refusal, summary_text, ...
 type ContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
+	Refusal  string `json:"refusal,omitempty"`
 	ImageURL string `json:"image_url,omitempty"` // Responses spells it image_url (string) on input
 	Detail   string `json:"detail,omitempty"`
 }
@@ -156,7 +185,13 @@ type Usage struct {
 	InputTokens         int                  `json:"input_tokens"`
 	OutputTokens        int                  `json:"output_tokens"`
 	TotalTokens         int                  `json:"total_tokens"`
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
 	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
+}
+
+// InputTokensDetails breaks down input token accounting (cache hits).
+type InputTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // OutputTokensDetails breaks down output token accounting.
@@ -176,6 +211,7 @@ type Event struct {
 	ContentIndex   int       `json:"content_index"`
 	Delta          string    `json:"delta,omitempty"`
 	Text           string    `json:"text,omitempty"`
+	Refusal        string    `json:"refusal,omitempty"`
 	Arguments      string    `json:"arguments,omitempty"`
 	Name           string    `json:"name,omitempty"`
 	CallID         string    `json:"call_id,omitempty"`

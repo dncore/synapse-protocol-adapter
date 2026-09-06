@@ -126,14 +126,21 @@ Then point any Responses-API client at `http://<host>:8787/v1`.
 | `model` | `model` |
 | `instructions` | prepended `system` message (skipped if input already has one) |
 | `input` (string) | one `user` message |
+| `prompt` (legacy alternative) | honored when `input` is absent |
+| `developer` role messages | normalized to `system` (semantically identical, universally accepted) |
+| consecutive `function_call` items (parallel calls) | merged into ONE assistant message with N `tool_calls` |
+| `function_call` with only `id`, no `call_id` | `id` used as the tool call id |
+| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it) |
+| tool `parameters` without top-level `type` | `{"type":"object"}` injected (several providers require it) |
 | `input[]` `message` items | messages (`system`/`developer`/`user`/`assistant` roles pass through) |
 | `input_text` / `output_text` / `summary_text` parts | `{type:"text"}` parts |
 | `input_image` parts | `{type:"image_url", image_url:{url}}` parts |
 | `function_call` items | assistant message with `tool_calls[]` |
-| `function_call_output` items | `{role:"tool", tool_call_id, content}` |
+| `function_call_output` items | `{role:"tool", tool_call_id, content}` (string **or** content-part array outputs) |
+| `refusal` content parts (history) | text parts carrying the refusal message |
 | `reasoning` items | dropped (no chat equivalent) |
 | `tools[]` (flattened) | `tools[]` (nested `function` object) |
-| `tool_choice` (`"auto"`/`"none"`/`"required"` or object form) | same, object form re-nested |
+| `tool_choice` (`"auto"`/`"none"`/`"required"` or object form) | normalized; Cursor-style `{"type":"none"}` etc. map to their string forms, `{"type":"tool"}` → `"required"`, `{"type":"function","name"}` re-nested |
 | `max_output_tokens` | `max_tokens` |
 | `temperature`, `top_p`, `parallel_tool_calls`, `user` | same names |
 | `response_format` / `text.format` (`json_schema`/`json_object`/`text`) | `response_format` |
@@ -146,11 +153,16 @@ Then point any Responses-API client at `http://<host>:8787/v1`.
 | Upstream | Client sees |
 |---|---|
 | `choices[0].message.content` | `output[]: {type:"message", content:[{type:"output_text"}]}` |
-| `choices[0].message.tool_calls[]` | one `{type:"function_call"}` output item each (parallel calls preserved) |
-| `finish_reason: stop / tool_calls` | `status: "completed"` |
-| `finish_reason: length` | `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"` |
-| `finish_reason: content_filter` | `status: "incomplete"` + `incomplete_details.reason: "content_filter"` |
+| `choices[0].message.refusal` | `{type:"refusal"}` content part |
+| `choices[0].message.reasoning_content` (DeepSeek-style) | `{type:"reasoning"}` output item with `summary_text` |
+| `choices[0].message.tool_calls[]` | one `{type:"function_call"}` output item each (parallel calls preserved, unique ids) |
+| `finish_reason: stop / tool_calls` | `status: "completed"` + `response.completed` |
+| `finish_reason: length` | `status: "incomplete"` + `response.incomplete` event + `max_output_tokens` reason |
+| `finish_reason: content_filter` | `status: "incomplete"` + `response.incomplete` event + `content_filter` reason |
+| `finish_reason: refusal` | `status: "incomplete"` + refusal content part |
 | `usage.prompt/completion/total_tokens` | `usage.input/output/total_tokens` |
+| `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` |
+| `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` |
 | upstream HTTP error | same status, Responses-shaped error body |
 
 ### Streaming event mapping
@@ -159,16 +171,22 @@ Then point any Responses-API client at `http://<host>:8787/v1`.
 upstream chunk                          Responses event(s)
 --------------------------------------- -------------------------------------------
 first chunk                             response.created, response.in_progress
+delta.reasoning_content (DeepSeek)      response.output_item.added (reasoning),
+                                        response.reasoning_summary_part.added
+delta.reasoning_content                 response.reasoning_summary_text.delta
 delta.content (first)                   response.output_item.added (message),
                                         response.content_part.added
 delta.content                           response.output_text.delta
+delta.refusal                           response.refusal.delta
 delta.tool_calls[i] (first appearance)  response.output_item.added (function_call)
 delta.tool_calls[i].function.arguments  response.function_call_arguments.delta
-finish_reason                           output_text.done, content_part.done,
-                                        output_item.done,
+finish_reason                           reasoning_summary_text.done (if any),
+                                        output_text.done / refusal.done,
+                                        content_part.done, output_item.done,
                                         function_call_arguments.done
 final usage chunk (empty choices)       (accounted into usage)
-[DONE]                                  response.completed (aggregated response + usage)
+[DONE]                                  response.completed — or response.incomplete
+                                        when finish_reason was length/content_filter
 ```
 
 Events carry strictly increasing `sequence_number`. Tool-call arguments

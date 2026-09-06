@@ -120,14 +120,21 @@ docker run --rm -p 8787:8787 \
 | `model` | `model` |
 | `instructions` | 前置 `system` 消息（input 已有 system 则跳过） |
 | `input`（字符串） | 一条 `user` 消息 |
+| `prompt`（legacy 备选） | `input` 缺失时启用 |
+| `developer` 角色消息 | 归一为 `system`（语义等价，普遍被接受） |
+| 连续 `function_call` item（并行调用） | 合并为一条带 N 个 `tool_calls` 的 assistant 消息 |
+| 只有 `id` 没有 `call_id` 的 `function_call` | 用 `id` 作为 tool call id |
+| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略） |
+| 顶层缺 `type` 的工具 `parameters` | 注入 `{"type":"object"}`（部分 provider 强制要求） |
 | `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
 | `input_text` / `output_text` / `summary_text` part | `{type:"text"}` part |
 | `input_image` part | `{type:"image_url", image_url:{url}}` part |
 | `function_call` item | 带 `tool_calls[]` 的 assistant 消息 |
-| `function_call_output` item | `{role:"tool", tool_call_id, content}` |
+| `function_call_output` item | `{role:"tool", tool_call_id, content}`（字符串**或**内容 part 数组） |
+| `refusal` 内容 part（历史） | 携带拒绝文本的 text part |
 | `reasoning` item | 丢弃（chat 侧无对应） |
 | `tools[]`（扁平结构） | `tools[]`（嵌套 `function` 对象） |
-| `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 同名，对象形式重新嵌套 |
+| `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 归一化；Cursor 风格 `{"type":"none"}` 映射为字符串形式，`{"type":"tool"}` → `"required"`，`{"type":"function","name"}` 重新嵌套 |
 | `max_output_tokens` | `max_tokens` |
 | `temperature`、`top_p`、`parallel_tool_calls`、`user` | 同名 |
 | `response_format` / `text.format`（`json_schema`/`json_object`/`text`） | `response_format` |
@@ -140,11 +147,16 @@ docker run --rm -p 8787:8787 \
 | Upstream | 客户端看到 |
 |---|---|
 | `choices[0].message.content` | `output[]: {type:"message", content:[{type:"output_text"}]}` |
-| `choices[0].message.tool_calls[]` | 每项一个 `{type:"function_call"}` 输出 item（并行调用保留） |
-| `finish_reason: stop / tool_calls` | `status: "completed"` |
-| `finish_reason: length` | `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"` |
-| `finish_reason: content_filter` | `status: "incomplete"` + `incomplete_details.reason: "content_filter"` |
+| `choices[0].message.refusal` | `{type:"refusal"}` 内容 part |
+| `choices[0].message.reasoning_content`（DeepSeek 风格） | `{type:"reasoning"}` 输出 item（summary_text） |
+| `choices[0].message.tool_calls[]` | 每项一个 `{type:"function_call"}` 输出 item（并行保留，id 唯一） |
+| `finish_reason: stop / tool_calls` | `status: "completed"` + `response.completed` |
+| `finish_reason: length` | `status: "incomplete"` + `response.incomplete` 事件 + `max_output_tokens` |
+| `finish_reason: content_filter` | `status: "incomplete"` + `response.incomplete` 事件 + `content_filter` |
+| `finish_reason: refusal` | `status: "incomplete"` + refusal 内容 part |
 | `usage.prompt/completion/total_tokens` | `usage.input/output/total_tokens` |
+| `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` |
+| `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` |
 | upstream HTTP 错误 | 状态码保留，错误体重塑为 Responses 形状 |
 
 ### 流式事件映射
@@ -153,16 +165,22 @@ docker run --rm -p 8787:8787 \
 upstream chunk                          Responses 事件
 --------------------------------------- -------------------------------------------
 首个 chunk                             response.created, response.in_progress
+delta.reasoning_content (DeepSeek)      response.output_item.added (reasoning),
+                                        response.reasoning_summary_part.added
+delta.reasoning_content                 response.reasoning_summary_text.delta
 delta.content（首次）                   response.output_item.added (message),
                                         response.content_part.added
 delta.content                           response.output_text.delta
+delta.refusal                           response.refusal.delta
 delta.tool_calls[i]（首次出现）         response.output_item.added (function_call)
 delta.tool_calls[i].function.arguments  response.function_call_arguments.delta
-finish_reason                           output_text.done, content_part.done,
-                                        output_item.done,
+finish_reason                           reasoning_summary_text.done（若有）,
+                                        output_text.done / refusal.done,
+                                        content_part.done, output_item.done,
                                         function_call_arguments.done
 末尾 usage chunk（空 choices）           （计入 usage）
-[DONE]                                  response.completed（聚合响应 + usage）
+[DONE]                                  response.completed —— finish_reason 为
+                                        length/content_filter 时为 response.incomplete
 ```
 
 事件携带严格递增的 `sequence_number`。tool-call 参数按 delta `index`

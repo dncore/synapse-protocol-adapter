@@ -19,6 +19,7 @@ type Request struct {
 	StreamOptions      *StreamOptions  `json:"stream_options,omitempty"`
 	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
 	ResponseFormat     json.RawMessage `json:"response_format,omitempty"`
+	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
 	User               string          `json:"user,omitempty"`
 	Seed               *int            `json:"seed,omitempty"`
 	Stop               []string        `json:"stop,omitempty"`
@@ -37,9 +38,13 @@ type StreamOptions struct {
 type Message struct {
 	Role         string         `json:"role"`
 	Content      MessageContent `json:"content,omitempty"`
-	Name         string         `json:"name,omitempty"`
-	ToolCallID   string         `json:"tool_call_id,omitempty"`
-	ToolCalls    []ToolCall     `json:"tool_calls,omitempty"`
+	Refusal      string         `json:"refusal,omitempty"`
+	// ReasoningContent is the DeepSeek-style thinking trace emitted by
+	// reasoning models (also `reasoning` on some providers).
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Name             string     `json:"name,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // MessageContent marshals as either a JSON string or an array of parts.
@@ -132,9 +137,18 @@ type Choice struct {
 
 // Usage is the token accounting block.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int              `json:"prompt_tokens"`
+	CompletionTokens        int              `json:"completion_tokens"`
+	TotalTokens             int              `json:"total_tokens"`
+	PromptTokensDetails     *TokenDetails    `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *TokenDetails    `json:"completion_tokens_details,omitempty"`
+}
+
+// TokenDetails carries provider-reported token breakdowns (cache hits,
+// reasoning tokens).
+type TokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // StreamChunk is one SSE data payload of a streamed chat completion.
@@ -158,9 +172,12 @@ type StreamChoice struct {
 
 // Delta is the incremental content of a streamed choice.
 type Delta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content"`
+	Refusal          string     `json:"refusal,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Reasoning        string     `json:"reasoning,omitempty"` // provider alias
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Error is the upstream error envelope: {"error":{...}}.

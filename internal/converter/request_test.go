@@ -77,8 +77,8 @@ func TestConvertRequest_RolesAndParts(t *testing.T) {
 	if len(out.Messages) != 3 {
 		t.Fatalf("want 3 messages, got %d", len(out.Messages))
 	}
-	if out.Messages[0].Role != "developer" {
-		t.Fatalf("developer role lost: %+v", out.Messages[0])
+	if out.Messages[0].Role != "system" {
+		t.Fatalf("developer must normalize to system for provider compatibility: %+v", out.Messages[0])
 	}
 	parts := out.Messages[1].Content.Parts
 	if len(parts) != 2 || parts[0].Type != "text" || parts[1].Type != "image_url" || parts[1].ImageURL.URL != "data:image/png;base64,AAA" {
@@ -92,7 +92,7 @@ func TestConvertRequest_ToolLoop(t *testing.T) {
 		Input: responses.Input{Items: []responses.Item{
 			{Type: "message", Role: "user", Content: responses.ItemContent{String: "weather?"}},
 			{Type: "function_call", CallID: "call_1", Name: "get_weather", Arguments: `{"city":"SF"}`},
-			{Type: "function_call_output", CallID: "call_1", Output: `{"temp":21}`},
+			{Type: "function_call_output", CallID: "call_1", Output: responses.OutputContent{String: `{"temp":21}`}},
 		}},
 	}
 	out, err := ConvertRequest(req)
