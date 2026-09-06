@@ -111,7 +111,8 @@ docker run --rm -p 8787:8787 \
 |---|---|---|
 | **裸进程** | `./protocol-proxy --config config.yaml` | 开发调试、快速实验 |
 | **systemd 服务** | `systemctl enable --now protocol-proxy` | Linux 服务器常驻（自动重启、journald 日志、优雅退出） |
-| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | 容器化环境；完整步骤见 [Docker](#docker) 与 [systemd](#systemd) |
+| **launchd 代理** | `launchctl bootstrap gui/$(id -u) …` | macOS 主机；见 [macOS（launchd）](#macos-launchd) |
+| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | 容器化环境；完整步骤见 [Docker](#docker)、[systemd](#systemd)、[macOS（launchd）](#macos-launchd) |
 
 托管方式与路由方式正交：`upstream.responses_mode`（`convert` 与
 `passthrough`）和 `/v1/*` 透明转发在三种方式下行为相同。
@@ -389,6 +390,45 @@ sudo systemctl restart protocol-proxy  # 先 drain 再重启
 
 unit 以专用非 root 系统用户运行，故障自动重启，SIGTERM 有 35 秒 drain
 时间。
+
+## macOS（launchd）
+
+macOS 原生的常驻机制是 launchd；仓库自带 LaunchAgent 模板：
+[`deploy/launchd/`](deploy/launchd/)。
+
+**1. 交叉编译**（任意机器可编；纯 Go 无 CGO。Intel Mac 用
+`DARWIN_ARCH=amd64`）：
+
+```bash
+make build-darwin                # → protocol-proxy-darwin-arm64
+scp protocol-proxy-darwin-arm64 mac:/usr/local/bin/protocol-proxy
+```
+
+**2. 配置**安装到 `/usr/local/etc/protocol-proxy/config.yaml`
+（格式与 Linux 相同）。
+
+**3. 安装 agent**（用户级、登录自启、无需 root）：
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+# 若安装路径不同，修改 plist 内的二进制/配置路径
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+```
+
+**4. 管理**——SIGTERM 触发与 systemd 相同的优雅 drain：
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # 重启
+launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # 停止并卸载
+tail -f /tmp/protocol-proxy.log                                   # 日志
+curl -s http://127.0.0.1:8787/health                              # 验证
+```
+
+与 Linux 的差异：日志写入 plist 的 `StandardOutPath` 文件而非
+journald；`KeepAlive` 对应 `Restart=`；局域网访问需在 系统设置 →
+网络 → 防火墙 放行入站。Docker 在 macOS 上同样可用，且
+`host.docker.internal` 原生解析到 Mac 本机。
 
 ## 局域网部署
 

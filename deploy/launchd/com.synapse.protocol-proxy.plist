@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd agent for synapse-protocol-adapter (macOS equivalent of the
+     systemd unit). Install as a per-user LaunchAgent:
+
+       mkdir -p ~/Library/LaunchAgents
+       cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+       # adjust the binary/config paths below to your install locations
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+
+     Manage:
+       launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # restart (SIGTERM drain)
+       launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # stop & unload
+       tail -f /tmp/protocol-proxy.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.synapse.protocol-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/protocol-proxy</string>
+        <string>--config</string>
+        <string>/usr/local/etc/protocol-proxy/config.yaml</string>
+    </array>
+
+    <!-- Start at login; restart if the process exits or crashes. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/protocol-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/protocol-proxy.log</string>
+
+    <!-- Optional: bypass a system HTTP proxy for internal upstreams.
+         Adjust or remove to match your network. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1</string>
+    </dict>
+</dict>
+</plist>

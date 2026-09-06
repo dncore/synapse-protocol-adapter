@@ -118,7 +118,8 @@ identical in all three; pick by environment:
 |---|---|---|
 | **Bare process** | `./protocol-proxy --config config.yaml` | Development, quick experiments |
 | **systemd service** | `systemctl enable --now protocol-proxy` | Linux servers, always-on daemons (auto-restart, journald, graceful drain) |
-| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | Containerized environments; see [Docker](#docker) and [systemd](#systemd) for full setup |
+| **launchd agent** | `launchctl bootstrap gui/$(id -u) …` | macOS hosts; see [macOS (launchd)](#macos-launchd) |
+| **Docker / Compose** | `docker run -p 8787:8787 protocol-proxy` | Containerized environments; see [Docker](#docker), [systemd](#systemd), [macOS (launchd)](#macos-launchd) for full setup |
 
 How the daemon is hosted is orthogonal to how it routes: the
 `upstream.responses_mode` knob (`convert` vs `passthrough`) and the
@@ -406,6 +407,46 @@ sudo systemctl restart protocol-proxy  # drains, then restarts
 
 The unit runs as a dedicated non-root system user, restarts on failure,
 and gives SIGTERM 35 s to drain.
+
+## macOS (launchd)
+
+The native always-on mechanism on macOS is launchd; the repo ships a
+ready LaunchAgent at [`deploy/launchd/`](deploy/launchd/).
+
+**1. Cross-compile** (from any machine; pure Go, no CGO — Intel Macs use
+`DARWIN_ARCH=amd64`):
+
+```bash
+make build-darwin                # → protocol-proxy-darwin-arm64
+scp protocol-proxy-darwin-arm64 mac:/usr/local/bin/protocol-proxy
+```
+
+**2. Install config** at `/usr/local/etc/protocol-proxy/config.yaml`
+(same format as Linux).
+
+**3. Install the agent** (per-user, starts at login, no root):
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+cp deploy/launchd/com.synapse.protocol-proxy.plist ~/Library/LaunchAgents/
+# adjust binary/config paths inside the plist if you installed elsewhere
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.protocol-proxy.plist
+```
+
+**4. Manage** — SIGTERM triggers the same graceful drain as systemd:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.synapse.protocol-proxy   # restart
+launchctl bootout      gui/$(id -u)/com.synapse.protocol-proxy   # stop & unload
+tail -f /tmp/protocol-proxy.log                                   # logs
+curl -s http://127.0.0.1:8787/health                              # verify
+```
+
+Notes vs Linux: logs go to the plist's `StandardOutPath` file instead of
+journald; `KeepAlive` replaces `Restart=`; for LAN access, allow inbound
+connections in System Settings → Network → Firewall. Docker on macOS
+also works unchanged, with `host.docker.internal` resolving to the Mac
+itself.
 
 ## LAN deployment
 
