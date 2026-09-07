@@ -208,7 +208,10 @@ func runService(args []string) error {
 // runCheckConfig loads and validates a config without starting the server.
 func runCheckConfig(args []string) error {
 	fs := flag.NewFlagSet("check-config", flag.ContinueOnError)
-	configPath := fs.String("config", "", "path to YAML config file")
+	// Same default as init/status/service: the user config file. (An
+	// empty default here made bare `synapse check-config` print built-in
+	// defaults while the daemon read the edited ~/.config file.)
+	configPath := fs.String("config", defaultServiceConfig(), "path to YAML config file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
