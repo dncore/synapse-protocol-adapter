@@ -18,6 +18,7 @@ upstream:
 
 limits:
   # Max in-flight proxy requests; further requests queue (backpressure).
+  # 0 = unlimited (trusted/internal deployments; upstream sets the pace).
   max_concurrency: 200
   # Max client request body size (bytes).
   max_body_bytes: 67108864        # 64 MiB

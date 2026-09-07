@@ -54,6 +54,16 @@ type Client struct {
 // and imposes no response-header timeout: reasoning models can legitimately
 // take minutes before the first byte; total request duration is bounded by
 // the per-request context instead.
+
+// idleConnsPerHost sizes the per-host idle pool: matched to the
+// concurrency cap when one is set, large-but-bounded when unlimited.
+func idleConnsPerHost(maxConcurrency int) int {
+	if maxConcurrency > 0 {
+		return maxConcurrency
+	}
+	return 10000
+}
+
 func NewClient(cfg config.Config) *Client {
 	tr := &http.Transport{
 		Proxy: nil, // never route the data path through a corporate proxy silently
@@ -61,8 +71,11 @@ func NewClient(cfg config.Config) *Client {
 			Timeout:   cfg.Timeouts.Connect,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:          cfg.Limits.MaxConcurrency,
-		MaxIdleConnsPerHost:   cfg.Limits.MaxConcurrency,
+		MaxIdleConns:          cfg.Limits.MaxConcurrency, // 0 = no limit
+		// PerHost 0 would fall back to net/http's default of 2 idle
+		// conns — fatal for a high-concurrency proxy — so unlimited
+		// mode gets a large explicit pool instead.
+		MaxIdleConnsPerHost:   idleConnsPerHost(cfg.Limits.MaxConcurrency),
 		MaxConnsPerHost:       0, // unbounded; concurrency is bounded upstream of us
 		IdleConnTimeout:       cfg.Timeouts.Idle,
 		TLSHandshakeTimeout:   cfg.Timeouts.Connect,

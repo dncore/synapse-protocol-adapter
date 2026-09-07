@@ -311,7 +311,7 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `upstream.base_url` | `http://127.0.0.1:8000/v1` | `PROXY_UPSTREAM_BASE_URL` | completions 路径之前的部分 |
 | `upstream.path` | `/chat/completions` | `PROXY_UPSTREAM_PATH` | 拼接在 `base_url` 后；legacy 后端设为 `/completions` |
 | `upstream.responses_mode` | `convert` | `PROXY_UPSTREAM_RESPONSES_MODE` | `convert` 把 `POST /v1/responses` 翻译成 chat completions；`passthrough` 转发到 upstream 的**原生** `/responses` 端点（适用于已实现 Responses API 的 provider——保留 reasoning item、服务端工具、store 语义） |
-| `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | 最大在途请求数；超出排队（背压） |
+| `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | 最大在途请求数；超出排队（背压）。`0` = 不限制 |
 | `limits.max_body_bytes` | `67108864` | `PROXY_LIMITS_MAX_BODY_BYTES` | 客户端请求体上限（字节） |
 | `limits.max_sse_line_bytes` | `16777216` | — | 单条 SSE data 行上限（大 tool 参数） |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |

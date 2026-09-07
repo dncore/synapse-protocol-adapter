@@ -428,6 +428,45 @@ func TestProxy_Concurrency(t *testing.T) {
 	}
 }
 
+// Unlimited mode (max_concurrency: 0): no semaphore, no queueing — all
+// requests go straight through regardless of count.
+func TestProxy_UnlimitedConcurrency(t *testing.T) {
+	up := &fakeUpstream{}
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := testConfig(upSrv.URL)
+	cfg.Limits.MaxConcurrency = 0
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := New(cfg, logger, metrics.NewRegistry())
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	const n = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(proxySrv.URL+"/v1/responses", "application/json", strings.NewReader(responsesBody(false)))
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				errs <- fmt.Errorf("status %d", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 // In-band rejection: gateway answers HTTP 200 but streams {"error":{...}}
 // as the (only) chunk. The client must see a clear error event, never a
 // silently empty response.completed.

@@ -52,7 +52,7 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 		logger:  logger,
 		metrics: reg,
 		client:  upstream.NewClient(cfg),
-		sem:     make(chan struct{}, cfg.Limits.MaxConcurrency),
+		sem:     newSemaphore(cfg.Limits.MaxConcurrency),
 	}
 	s.ready.Store(true)
 
@@ -200,10 +200,22 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // --- the proxy endpoint ---
 
+// newSemaphore returns a counting channel of size n, or nil when n <= 0
+// (unlimited — acquireSlot becomes a no-op).
+func newSemaphore(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
+
 // acquireSlot bounds concurrency with a semaphore; blocking acquire
 // applies backpressure and honors client cancellation while queued. It
 // returns nil when the client went away before a slot freed up.
 func (s *Server) acquireSlot(r *http.Request) func() {
+	if s.sem == nil { // unlimited
+		return func() {}
+	}
 	select {
 	case s.sem <- struct{}{}:
 		return func() { <-s.sem }

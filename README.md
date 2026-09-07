@@ -330,7 +330,7 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `upstream.base_url` | `http://127.0.0.1:8000/v1` | `PROXY_UPSTREAM_BASE_URL` | Everything before the completions path |
 | `upstream.path` | `/chat/completions` | `PROXY_UPSTREAM_PATH` | Appended to `base_url`; `/completions` for legacy backends |
 | `upstream.responses_mode` | `convert` | `PROXY_UPSTREAM_RESPONSES_MODE` | `convert` translates `POST /v1/responses` to chat completions; `passthrough` forwards it to the upstream's **native** `/responses` endpoint (for providers that already implement the Responses API — keeps reasoning items, server-side tools, store semantics intact) |
-| `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | Max in-flight requests; others queue (backpressure) |
+| `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | Max in-flight requests; others queue (backpressure). `0` = unlimited |
 | `limits.max_body_bytes` | `67108864` | `PROXY_LIMITS_MAX_BODY_BYTES` | Max client request body (bytes) |
 | `limits.max_sse_line_bytes` | `16777216` | — | Max single SSE data line (large tool arguments) |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |

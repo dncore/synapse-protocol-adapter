@@ -66,6 +66,9 @@ func (u Upstream) URL() string {
 
 // Limits bounds resource usage.
 type Limits struct {
+	// MaxConcurrency caps in-flight proxy requests; further requests
+	// queue (backpressure). 0 means unlimited — for trusted/internal
+	// deployments that prefer to let the upstream set the pace.
 	MaxConcurrency int `yaml:"max_concurrency"`
 	MaxBodyBytes   int `yaml:"max_body_bytes"`
 	MaxSSELine     int `yaml:"max_sse_line_bytes"`
@@ -215,8 +218,8 @@ func Validate(cfg *Config) error {
 	default:
 		errs = append(errs, fmt.Errorf("upstream.responses_mode must be \"convert\" or \"passthrough\", got %q", cfg.Upstream.ResponsesMode))
 	}
-	if cfg.Limits.MaxConcurrency <= 0 {
-		errs = append(errs, errors.New("limits.max_concurrency must be > 0"))
+	if cfg.Limits.MaxConcurrency < 0 {
+		errs = append(errs, errors.New("limits.max_concurrency must be >= 0 (0 = unlimited)"))
 	}
 	if cfg.Limits.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("limits.max_body_bytes must be > 0"))

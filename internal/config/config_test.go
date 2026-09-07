@@ -96,7 +96,7 @@ func TestValidate_Errors(t *testing.T) {
 		{"no listen", func(c *Config) { c.Server.Listen = "" }, "server.listen"},
 		{"bad url", func(c *Config) { c.Upstream.BaseURL = "not a url" }, "upstream.base_url"},
 		{"bad scheme", func(c *Config) { c.Upstream.BaseURL = "ftp://x" }, "upstream.base_url"},
-		{"zero concurrency", func(c *Config) { c.Limits.MaxConcurrency = 0 }, "max_concurrency"},
+		{"negative concurrency", func(c *Config) { c.Limits.MaxConcurrency = -1 }, "max_concurrency"},
 		{"zero connect", func(c *Config) { c.Timeouts.Connect = 0 }, "timeouts.connect"},
 		{"bad log format", func(c *Config) { c.Log.Format = "syslog" }, "log.format"},
 		{"bad responses_mode", func(c *Config) { c.Upstream.ResponsesMode = "both" }, "responses_mode"},
@@ -110,6 +110,15 @@ func TestValidate_Errors(t *testing.T) {
 				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// 0 means unlimited and must validate cleanly.
+func TestValidate_UnlimitedConcurrency(t *testing.T) {
+	cfg := Defaults()
+	cfg.Limits.MaxConcurrency = 0
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("max_concurrency 0 (unlimited) must validate, got %v", err)
 	}
 }
 
