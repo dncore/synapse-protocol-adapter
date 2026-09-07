@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -190,8 +191,16 @@ func Install(configPath string, startNow bool) error {
 			return err
 		}
 		// Linger keeps the user manager alive after logout so the
-		// service survives reconnects/headless use.
-		run("loginctl", "enable-linger") // best-effort; non-fatal
+		// service survives reconnects/headless use. Over SSH polkit
+		// may demand interactive auth (and leak a pkttyagent error);
+		// surface a actionable warning instead of failing silently.
+		if err := run("loginctl", "enable-linger"); err != nil {
+			user, _ := user.Current()
+			fmt.Fprintf(os.Stderr, "warning: could not enable linger (%v)\n"+
+				"The service is installed and running, but it will NOT start at boot\n"+
+				"until linger is on. Fix once with:\n"+
+				"  sudo loginctl enable-linger %s\n", err, user.Username)
+		}
 		if startNow {
 			return run("systemctl", "--user", "start", ServiceName)
 		}
