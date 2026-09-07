@@ -12,17 +12,20 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
 
-// handlePassthrough transparently forwards any /v1/* request (other than
-// /v1/responses, which the converter owns) to the configured upstream:
-// same method, same path below /v1, same query, body streamed unmodified,
-// response streamed byte-for-byte with a flush per read. Upstream errors
-// pass through verbatim — this route never rewrites semantics.
+// handlePassthrough transparently forwards any /v1/* or /api/v1/*
+// request (other than the /v1/responses routes the converter owns) to
+// the configured upstream: same method, same path below the prefix, same
+// query, body streamed unmodified, response streamed byte-for-byte with
+// a flush per read. /api/anthropic/* additionally forwards with the path
+// preserved against the upstream HOST root — Anthropic-protocol mounts
+// live beside the chat-completions base_url, not under it. Upstream
+// errors pass through verbatim — this route never rewrites semantics.
 //
 // This makes the proxy a scoped reverse proxy for its single upstream
-// (not an open proxy): everything under /v1/ reaches that provider and
-// nothing else, which is exactly the local-forwarder role socat plays —
-// with pooling, cancellation propagation, backpressure, and metrics that
-// socat does not have.
+// (not an open proxy): everything under the served prefixes reaches that
+// provider and nothing else, which is exactly the local-forwarder role
+// socat plays — with pooling, cancellation propagation, backpressure,
+// and metrics that socat does not have.
 func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.metrics.RequestsTotal.Inc()
@@ -44,8 +47,16 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	upStart := time.Now()
-	resp, err := s.client.DoPassthrough(ctx, r.Method,
-		stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
+	// /api/anthropic/* keeps its full path against the upstream host
+	// root; the /v1 styles strip their prefix onto the base_url.
+	var resp *http.Response
+	var err error
+	if strings.HasPrefix(r.URL.Path, "/api/anthropic/") {
+		resp, err = s.client.DoPassthroughRoot(ctx, r.Method, r.URL.Path, r.URL.RawQuery, body, r.Header)
+	} else {
+		resp, err = s.client.DoPassthrough(ctx, r.Method,
+			stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
+	}
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()

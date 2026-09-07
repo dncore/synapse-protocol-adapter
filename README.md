@@ -229,6 +229,15 @@ real answer from `/v1/models`. It replaces a local `socat`/TCP forwarder
 for this upstream — with connection pooling, client-disconnect
 cancellation, backpressure, and metrics that socat does not provide.
 
+**Anthropic-protocol clients**: everything under `/api/anthropic/` is
+also forwarded transparently, but with the path preserved against the
+upstream **host root** instead of joined onto `base_url` — gateways
+(e.g. new-api style) mount the Anthropic protocol *beside* the
+chat-completions base (`/api/v1/*`), not under it. Point
+`ANTHROPIC_BASE_URL=http://<proxy-host>:<port>/api/anthropic` at the
+proxy and `/v1/messages` lands at the gateway's
+`/api/anthropic/v1/messages` (same for Claude Code).
+
 Scope note: this is a scoped reverse proxy for the **single configured
 upstream**, not an open proxy — `/v1/*` reaches that provider and nothing
 else. Only HTTP is forwarded (no WebSocket upgrades).

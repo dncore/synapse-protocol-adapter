@@ -211,6 +211,14 @@ Codex 的模型选择器也能从 `/v1/models` 拿到真实结果。它可以取
 的 `socat`/TCP 转发——且多了连接复用、客户端断开取消、背压和
 metrics 这些 socat 没有的能力。
 
+**Anthropic 协议客户端**：`/api/anthropic/` 下的一切同样透明转发，
+但路径**按 upstream 主机根保留**、而非拼接到 `base_url`——网关
+（new-api 风格）把 Anthropic 协议挂在 chat-completions base
+（`/api/v1/*`）**旁边**而不是其下。把
+`ANTHROPIC_BASE_URL=http://<代理主机>:<端口>/api/anthropic` 指向代理，
+`/v1/messages` 就会落到网关的 `/api/anthropic/v1/messages`（Claude Code
+同理）。
+
 范围说明：这是对**单一已配置 upstream** 的限定反向代理，不是开放代
 理——`/v1/*` 只能到达该 provider，到不了任何其他主机。仅转发 HTTP
 （不支持 WebSocket 升级）。

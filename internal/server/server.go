@@ -74,6 +74,10 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	// specific /responses patterns win for the converted route.
 	mux.HandleFunc("/v1/", s.handlePassthrough)
 	mux.HandleFunc("/api/v1/", s.handlePassthrough)
+	// Anthropic-protocol clients (ANTHROPIC_BASE_URL=http://host:port/api/anthropic)
+	// hit /api/anthropic/*; gateways mount that protocol beside the
+	// chat-completions base, so it forwards host-root-preserved.
+	mux.HandleFunc("/api/anthropic/", s.handlePassthrough)
 
 	// Middleware order (outermost first): RequestID assigns the ID so every
 	// inner layer (including logs and panics) can reference it; AccessLog

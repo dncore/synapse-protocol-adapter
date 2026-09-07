@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 )
 
@@ -362,4 +363,41 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// /api/anthropic/* must keep its full path against the upstream HOST
+// root — gateways mount the Anthropic protocol beside the base_url path.
+func TestPassthrough_AnthropicHostRoot(t *testing.T) {
+	var gotPath, gotKey string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotKey = r.URL.Path, r.Header.Get("x-api-key")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_1","content":[]}`))
+	}))
+	defer up.Close()
+
+	// base_url carries a path component, as real gateways have it.
+	cfg := config.Defaults()
+	cfg.Upstream.BaseURL = up.URL + "/api/v1"
+	s := New(cfg, newTestLogger(), newTestRegistry())
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	req, _ := http.NewRequest("POST", proxy.URL+"/api/anthropic/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("x-api-key", "sk-ant-test")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if gotPath != "/api/anthropic/v1/messages" {
+		t.Fatalf("upstream path = %q, want /api/anthropic/v1/messages (host-root preserved, not /api/v1/api/anthropic/...)", gotPath)
+	}
+	if gotKey != "sk-ant-test" {
+		t.Fatalf("x-api-key not forwarded verbatim: %q", gotKey)
+	}
 }

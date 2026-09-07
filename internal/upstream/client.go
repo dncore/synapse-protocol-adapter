@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ type Client struct {
 	http *http.Client
 	url  string // converted-route endpoint (base + configured path)
 	base string // base_url without trailing slash, for passthrough routing
+	root string // scheme://host of base_url, for host-root passthrough (/api/anthropic/*)
 	cfg  config.Config
 }
 
@@ -85,10 +87,15 @@ func NewClient(cfg config.Config) *Client {
 		// negotiates gzip itself and transparently decompresses, so the SSE
 		// parser sees plain bytes.
 	}
+	root := ""
+	if u, err := url.Parse(cfg.Upstream.BaseURL); err == nil {
+		root = u.Scheme + "://" + u.Host
+	}
 	return &Client{
 		http: &http.Client{Transport: tr},
 		url:  cfg.Upstream.URL(),
 		base: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		root: root,
 		cfg:  cfg,
 	}
 }
@@ -97,9 +104,22 @@ func NewClient(cfg config.Config) *Client {
 // targeting base_url + path with the client's headers attached. It is the
 // transparent-forwarding counterpart of Do: no body transformation, no
 // endpoint assumptions. path is the request path below /v1 (e.g.
-// "/chat/completions"); rawQuery is forwarded verbatim.
+// "/chat/completions"), joined onto the configured base_url; rawQuery
+// is forwarded verbatim.
 func (c *Client) DoPassthrough(ctx context.Context, method, path, rawQuery string, body io.Reader, clientHeaders http.Header) (*http.Response, error) {
-	u := c.base + path
+	return c.do(ctx, c.base+path, method, rawQuery, body, clientHeaders)
+}
+
+// DoPassthroughRoot forwards with the path preserved against the
+// upstream HOST root, ignoring any path in base_url. Anthropic-protocol
+// mounts live beside (not under) the chat-completions base — e.g.
+// gateway OpenAI at /api/v1/*, Anthropic at /api/anthropic/* — so a
+// client's /api/anthropic/v1/messages must land at exactly that path.
+func (c *Client) DoPassthroughRoot(ctx context.Context, method, path, rawQuery string, body io.Reader, clientHeaders http.Header) (*http.Response, error) {
+	return c.do(ctx, c.root+path, method, rawQuery, body, clientHeaders)
+}
+
+func (c *Client) do(ctx context.Context, u, method, rawQuery string, body io.Reader, clientHeaders http.Header) (*http.Response, error) {
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
