@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/middleware"
 	"github.com/dncore/synapse-protocol-adapter/internal/responses"
 	"github.com/dncore/synapse-protocol-adapter/internal/streaming"
+	"github.com/dncore/synapse-protocol-adapter/internal/tlscert"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
 
@@ -113,19 +115,57 @@ func (s *Server) trackConns(conn net.Conn, state http.ConnState) {
 // Run listens, serves, and blocks until SIGTERM/SIGINT (or ctx done), then
 // drains gracefully.
 func (s *Server) Run(ctx context.Context) error {
+	// TLS material loads before the port opens so a certificate problem
+	// fails startup outright instead of serving a broken listener.
+	if s.cfg.Server.TLS.Enabled {
+		mat, err := tlscert.Load(s.cfg.Server.TLS)
+		if err != nil {
+			return fmt.Errorf("server.tls: %w", err)
+		}
+		s.httpSrv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{mat.Certificate},
+			MinVersion:   tls.VersionTLS12,
+		}
+		source := "cert " + s.cfg.Server.TLS.CertFile
+		if s.cfg.Server.TLS.CertFile == "" {
+			source = "auto (" + mat.CACertPath + ")"
+			if mat.GeneratedCA {
+				s.logger.Info("generated self-signed CA — import it into clients' trust stores (once)",
+					"ca", mat.CACertPath,
+					"linux_debian_ubuntu", "sudo cp "+mat.CACertPath+" /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates",
+					"linux_fedora_arch", "sudo trust anchor --store "+mat.CACertPath,
+					"macos", "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "+mat.CACertPath,
+					"curl", "--cacert "+mat.CACertPath,
+					"node", "NODE_EXTRA_CA_CERTS="+mat.CACertPath,
+					"python", "REQUESTS_CA_BUNDLE="+mat.CACertPath,
+				)
+			}
+		}
+		s.logger.Info("tls enabled", "source", source)
+	}
+
 	ln, err := net.Listen("tcp", s.cfg.Server.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.Server.Listen, err)
 	}
 	s.logger.Info("listening",
 		"addr", s.cfg.Server.Listen,
+		"tls", s.cfg.Server.TLS.Enabled,
 		"upstream", s.cfg.Upstream.URL(),
 		"max_concurrency", s.cfg.Limits.MaxConcurrency,
 		"version", Version,
 	)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- s.httpSrv.Serve(ln) }()
+	go func() {
+		// ServeTLS with empty file names serves TLSConfig.Certificates and
+		// enables HTTP/2; plain Serve stays HTTP/1.1-only.
+		if s.cfg.Server.TLS.Enabled {
+			errCh <- s.httpSrv.ServeTLS(ln, "", "")
+			return
+		}
+		errCh <- s.httpSrv.Serve(ln)
+	}()
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)

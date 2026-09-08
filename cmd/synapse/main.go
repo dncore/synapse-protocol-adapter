@@ -6,9 +6,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -132,7 +134,9 @@ Usage:
                                        (systemd user unit / launchd agent)
   synapse service uninstall            remove the service (keeps config)
   synapse check-config [--config PATH] validate a config and exit
-  synapse healthcheck [--url URL]      probe a running daemon (Docker HEALTHCHECK)
+  synapse healthcheck [--url URL] [--config PATH]
+                                       probe a running daemon (Docker HEALTHCHECK);
+                                       default URL follows server.tls (https)
   synapse --version                    print version and exit
 
 The default config path for service commands is
@@ -224,15 +228,49 @@ func runCheckConfig(args []string) error {
 }
 
 // runHealthcheck GETs the health endpoint; used by the Docker HEALTHCHECK
-// (distroless images ship no curl/wget).
+// (distroless images ship no curl/wget). The default URL is derived from
+// the config — https and skip-verify when server.tls is enabled (self-
+// probe of the daemon's own liveness).
 func runHealthcheck(args []string) error {
 	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
-	url := fs.String("url", "http://127.0.0.1:8787/health", "health endpoint URL")
+	url := fs.String("url", "", "health endpoint URL (default: derived from config)")
+	configPath := fs.String("config", "", "config file the daemon runs with (default: `synapse init` location if present)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	target := *url
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(*url)
+	if target == "" {
+		// Same resolution as status: the user config file when present
+		// (Docker mounts it elsewhere and drives TLS via env instead),
+		// otherwise built-in defaults + env.
+		path := *configPath
+		if path == "" {
+			path = defaultServiceConfig()
+		}
+		if _, err := os.Stat(path); err != nil {
+			path = "" // absent: fall back to defaults + env
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		host, port, _ := net.SplitHostPort(cfg.Server.Listen)
+		if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+			host = "127.0.0.1"
+		}
+		scheme := "http"
+		if cfg.Server.TLS.Enabled {
+			scheme = "https"
+			client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		}
+		target = scheme + "://" + net.JoinHostPort(host, port) + "/health"
+	} else if strings.HasPrefix(target, "https://") {
+		// Explicit https URL: a liveness self-probe must not fail on the
+		// self-signed certificate it is probing.
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	resp, err := client.Get(target)
 	if err != nil {
 		return err
 	}

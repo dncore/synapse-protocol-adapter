@@ -316,6 +316,10 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | 配置项 | 默认值 | 环境变量 | 说明 |
 |---|---|---|---|
 | `server.listen` | `0.0.0.0:8787` | `PROXY_SERVER_LISTEN` | 监听地址；`0.0.0.0` 对局域网开放 |
+| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | 监听端口改用 HTTPS——供强制 `https://` base_url 的 agent 使用（见 [HTTPS 监听](#https-监听-tls)）。与 upstream 的协议无关 |
+| `server.tls.cert_file` / `key_file` | — | `PROXY_SERVER_TLS_CERT_FILE` / `_KEY_FILE` | 自带 PEM 证书（Let's Encrypt、内部 CA、mkcert）；两者须成对设置。不设 = 自动生成自签名 CA |
+| `server.tls.auto_dir` | `~/.config/synapse/tls` | `PROXY_SERVER_TLS_AUTO_DIR` | 生成的 CA 与证书的持久化目录 |
+| `server.tls.sans` | — | `PROXY_SERVER_TLS_SANS`（逗号分隔） | 追加到生成证书 SAN 的域名/IP（默认已覆盖 localhost、主机名、所有网卡 IP） |
 | `upstream.base_url` | `http://127.0.0.1:8000/v1` | `PROXY_UPSTREAM_BASE_URL` | completions 路径之前的部分 |
 | `upstream.path` | `/chat/completions` | `PROXY_UPSTREAM_PATH` | 拼接在 `base_url` 后；legacy 后端设为 `/completions` |
 | `upstream.responses_mode` | `convert` | `PROXY_UPSTREAM_RESPONSES_MODE` | `convert` 把 `POST /v1/responses` 翻译成 chat completions；`passthrough` 转发到 upstream 的**原生** `/responses` 端点（适用于已实现 Responses API 的 provider——保留 reasoning item、服务端工具、store 语义） |
@@ -487,6 +491,67 @@ sudo iptables -A INPUT -p tcp --dport 8787 -j ACCEPT                            
 ```
 
 3. B 上的客户端指向 `http://<A的局域网IP>:8787/v1`。
+
+## HTTPS 监听 (TLS)
+
+有些 agent 强制要求 provider base_url 必须是 `https://`。打开一个开关，
+监听端口即改说 HTTPS——而代理访问 upstream 的方式完全不变，两个方向互相
+独立：
+
+```yaml
+server:
+  listen: "0.0.0.0:8787"
+  tls:
+    enabled: true
+upstream:
+  base_url: "http://127.0.0.1:8000/v1"   # 保持 http——这正是本功能的意义
+```
+
+未配置 `cert_file`/`key_file` 时，首次启动会**自动生成自签名 CA 与服务器
+证书**（mkcert 模式，ECDSA P-256，CA 有效期 10 年，叶子证书 825 天、到期
+自动续签），持久化在 `~/.config/synapse/tls/`。证书 SAN 覆盖 `localhost`、
+主机名、所有网卡 IP，以及 `sans:` 追加的条目。客户端需要信任该 CA（一次
+即可）：
+
+```bash
+# Debian/Ubuntu
+sudo cp ~/.config/synapse/tls/ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
+# Fedora/Arch
+sudo trust anchor --store ~/.config/synapse/tls/ca.pem
+# macOS
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.config/synapse/tls/ca.pem
+```
+
+agent 侧不动系统信任库的替代方案：
+
+| 客户端运行时 | 信任方式 |
+|---|---|
+| curl | `--cacert ~/.config/synapse/tls/ca.pem` |
+| Node（Claude Code 等） | `NODE_EXTRA_CA_CERTS=~/.config/synapse/tls/ca.pem` |
+| Python | `REQUESTS_CA_BUNDLE=~/.config/synapse/tls/ca.pem`（或 `SSL_CERT_FILE`） |
+| Go | `SSL_CERT_FILE=~/.config/synapse/tls/ca.pem` |
+
+已有真证书（内部 CA、DNS 挑战的 Let's Encrypt、mkcert）则跳过生成：
+
+```yaml
+server:
+  tls:
+    enabled: true
+    cert_file: /etc/synapse/cert.pem
+    key_file: /etc/synapse/key.pem
+```
+
+说明：
+
+- TLS 下自动协商 HTTP/2，流式行为完全一致。
+- `synapse status` 与 `synapse healthcheck` 会按配置改走 `https` 探测
+  （自探测不校验证书）。Docker 的 `HEALTHCHECK` 无需改动——挂载配置或设
+  `PROXY_SERVER_TLS_ENABLED=true` 即可。
+- Docker：自动生成的 CA 在容器文件系统里——把 `server.tls.auto_dir` 挂成
+  volume，否则每次重启都会换一个客户端不认识的新 CA。挂载证书文件的部署
+  不受影响。
+- **TLS 只是传输加密，不是认证**——代理仍原样转发收到的 `Authorization`
+  header。参见 [安全说明](#安全说明)。
 
 ## Codex 配置
 

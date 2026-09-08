@@ -37,6 +37,29 @@ type Config struct {
 // Server is the listener configuration.
 type Server struct {
 	Listen string `yaml:"listen"`
+	TLS    TLS    `yaml:"tls"`
+}
+
+// TLS serves the listener over HTTPS — for agents that require an
+// https:// base URL. It is independent of the upstream scheme:
+// upstream.base_url keeps its own http:// or https:// as before.
+type TLS struct {
+	// Enabled serves server.listen over TLS. With CertFile/KeyFile unset,
+	// a self-signed CA plus server certificate is generated on first start
+	// and persisted under AutoDir (clients import the CA once).
+	Enabled bool `yaml:"enabled"`
+	// CertFile/KeyFile are PEM files for bring-your-own certificates
+	// (Let's Encrypt, internal CA, mkcert). Both must be set together;
+	// when set, nothing is generated.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// AutoDir persists the generated CA and certificate. Empty means the
+	// platform default (~/.config/synapse/tls).
+	AutoDir string `yaml:"auto_dir"`
+	// SANs are extra DNS names or IPs added to the generated certificate
+	// (the defaults already cover localhost, the machine hostname, and
+	// every interface IP). Ignored with CertFile/KeyFile.
+	SANs []string `yaml:"sans"`
 }
 
 // Upstream is the target chat completions provider.
@@ -143,6 +166,29 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PROXY_SERVER_LISTEN"); v != "" {
 		cfg.Server.Listen = v
 	}
+	if v := os.Getenv("PROXY_SERVER_TLS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Server.TLS.Enabled = b
+		}
+	}
+	if v := os.Getenv("PROXY_SERVER_TLS_CERT_FILE"); v != "" {
+		cfg.Server.TLS.CertFile = v
+	}
+	if v := os.Getenv("PROXY_SERVER_TLS_KEY_FILE"); v != "" {
+		cfg.Server.TLS.KeyFile = v
+	}
+	if v := os.Getenv("PROXY_SERVER_TLS_AUTO_DIR"); v != "" {
+		cfg.Server.TLS.AutoDir = v
+	}
+	if v := os.Getenv("PROXY_SERVER_TLS_SANS"); v != "" {
+		var sans []string
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				sans = append(sans, s)
+			}
+		}
+		cfg.Server.TLS.SANs = sans
+	}
 	if v := os.Getenv("PROXY_UPSTREAM_BASE_URL"); v != "" {
 		cfg.Upstream.BaseURL = v
 	}
@@ -201,6 +247,19 @@ func Validate(cfg *Config) error {
 
 	if cfg.Server.Listen == "" {
 		errs = append(errs, errors.New("server.listen must be set (e.g. \"0.0.0.0:8787\")"))
+	}
+	if (cfg.Server.TLS.CertFile == "") != (cfg.Server.TLS.KeyFile == "") {
+		errs = append(errs, errors.New("server.tls.cert_file and server.tls.key_file must be set together"))
+	}
+	if cfg.Server.TLS.CertFile != "" {
+		if !cfg.Server.TLS.Enabled {
+			errs = append(errs, errors.New("server.tls.cert_file is set but server.tls.enabled is false"))
+		}
+		for name, f := range map[string]string{"cert_file": cfg.Server.TLS.CertFile, "key_file": cfg.Server.TLS.KeyFile} {
+			if _, err := os.Stat(f); err != nil {
+				errs = append(errs, fmt.Errorf("server.tls.%s %q is not readable: %v", name, f, err))
+			}
+		}
 	}
 	if cfg.Upstream.BaseURL == "" {
 		errs = append(errs, errors.New("upstream.base_url must be set (e.g. \"http://127.0.0.1:8000/v1\")"))

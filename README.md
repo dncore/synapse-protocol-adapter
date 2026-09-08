@@ -336,6 +336,10 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `server.listen` | `0.0.0.0:8787` | `PROXY_SERVER_LISTEN` | Listen address; `0.0.0.0` exposes to the LAN |
+| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | Serve the listener over HTTPS — for agents whose base_url must be `https://` (see [HTTPS listener](#https-listener-tls)). Independent of the upstream scheme |
+| `server.tls.cert_file` / `key_file` | — | `PROXY_SERVER_TLS_CERT_FILE` / `_KEY_FILE` | Bring-your-own PEM certificate (Let's Encrypt, internal CA, mkcert); both together. Unset = auto-generated self-signed CA |
+| `server.tls.auto_dir` | `~/.config/synapse/tls` | `PROXY_SERVER_TLS_AUTO_DIR` | Where the generated CA + certificate persist |
+| `server.tls.sans` | — | `PROXY_SERVER_TLS_SANS` (comma-separated) | Extra DNS names / IPs in the generated certificate (defaults cover localhost, hostname, every interface IP) |
 | `upstream.base_url` | `http://127.0.0.1:8000/v1` | `PROXY_UPSTREAM_BASE_URL` | Everything before the completions path |
 | `upstream.path` | `/chat/completions` | `PROXY_UPSTREAM_PATH` | Appended to `base_url`; `/completions` for legacy backends |
 | `upstream.responses_mode` | `convert` | `PROXY_UPSTREAM_RESPONSES_MODE` | `convert` translates `POST /v1/responses` to chat completions; `passthrough` forwards it to the upstream's **native** `/responses` endpoint (for providers that already implement the Responses API — keeps reasoning items, server-side tools, store semantics intact) |
@@ -508,6 +512,74 @@ sudo iptables -A INPUT -p tcp --dport 8787 -j ACCEPT                            
 ```
 
 3. Point clients on B at `http://<A's-LAN-IP>:8787/v1`.
+
+## HTTPS listener (TLS)
+
+Some agents refuse `http://` provider base URLs outright. Flip one switch
+and the listener speaks HTTPS — the proxy then still talks plain HTTP (or
+HTTPS) to the upstream exactly as before; the two directions are
+independent:
+
+```yaml
+server:
+  listen: "0.0.0.0:8787"
+  tls:
+    enabled: true
+upstream:
+  base_url: "http://127.0.0.1:8000/v1"   # stays http — that's the point
+```
+
+With no `cert_file`/`key_file` configured, the first start generates a
+**self-signed CA plus server certificate** (mkcert-style, ECDSA P-256,
+CA valid 10 years, leaf 825 days and renewed automatically) and persists
+both under `~/.config/synapse/tls/`. The leaf covers `localhost`, the
+machine hostname, every interface IP, plus any `sans:` entries. Clients
+must trust the generated CA once:
+
+```bash
+# Debian/Ubuntu
+sudo cp ~/.config/synapse/tls/ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
+# Fedora/Arch
+sudo trust anchor --store ~/.config/synapse/tls/ca.pem
+# macOS
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.config/synapse/tls/ca.pem
+```
+
+Agent-side, without touching the system store:
+
+| Client runtime | Trust the CA via |
+|---|---|
+| curl | `--cacert ~/.config/synapse/tls/ca.pem` |
+| Node (Claude Code etc.) | `NODE_EXTRA_CA_CERTS=~/.config/synapse/tls/ca.pem` |
+| Python | `REQUESTS_CA_BUNDLE=~/.config/synapse/tls/ca.pem` (or `SSL_CERT_FILE`) |
+| Go | `SSL_CERT_FILE=~/.config/synapse/tls/ca.pem` |
+
+Already have a real certificate (internal CA, Let's Encrypt via DNS
+challenge, mkcert)? Skip generation entirely:
+
+```yaml
+server:
+  tls:
+    enabled: true
+    cert_file: /etc/synapse/cert.pem
+    key_file: /etc/synapse/key.pem
+```
+
+Notes:
+
+- HTTP/2 is negotiated automatically over TLS; streaming behavior is
+  identical.
+- `synapse status` and `synapse healthcheck` follow the config and probe
+  over `https` (self-probe: certificate not verified). Docker's
+  `HEALTHCHECK` keeps working — mount the config or set
+  `PROXY_SERVER_TLS_ENABLED=true`.
+- Docker: the auto-generated CA lives in the container filesystem —
+  mount `server.tls.auto_dir` as a volume, or every restart mints a new
+  CA your clients no longer trust. With mounted cert files this does not
+  apply.
+- **TLS is transport encryption, not authentication** — the proxy still
+  forwards whatever `Authorization` header arrives. See
+  [Security notes](#security-notes).
 
 ## Codex configuration
 

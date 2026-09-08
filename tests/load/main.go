@@ -11,6 +11,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -30,11 +31,16 @@ func main() {
 		stream     = flag.Bool("stream", false, "streaming mode (measures first-byte latency)")
 		tools      = flag.Int("tools", 0, "attach N tool definitions")
 		model      = flag.String("model", "bench-model", "model name")
+		insecure   = flag.Bool("insecure", false, "skip TLS verification (self-signed certificates)")
 	)
 	flag.Parse()
 
 	body := buildBody(*stream, *tools, *model)
-	client := &http.Client{Timeout: 0}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if *insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	client := &http.Client{Timeout: 0, Transport: transport}
 
 	var (
 		total      atomic.Int64

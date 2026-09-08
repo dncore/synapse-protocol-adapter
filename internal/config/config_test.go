@@ -158,3 +158,82 @@ func TestLoad_MalformedYAML(t *testing.T) {
 		t.Fatal("expected parse error")
 	}
 }
+
+func TestLoad_TLSYAMLAndEnv(t *testing.T) {
+	path := writeTemp(t, `
+server:
+  listen: "127.0.0.1:9999"
+  tls:
+    enabled: true
+    sans: ["box.example.com", "10.1.2.3"]
+upstream:
+  base_url: "http://llm:8000/v1"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Server.TLS.Enabled || len(cfg.Server.TLS.SANs) != 2 {
+		t.Fatalf("tls yaml not parsed: %+v", cfg.Server.TLS)
+	}
+
+	t.Setenv("PROXY_SERVER_TLS_ENABLED", "false")
+	t.Setenv("PROXY_SERVER_TLS_SANS", " other.example.com ,  10.9.8.7,")
+	t.Setenv("PROXY_SERVER_TLS_AUTO_DIR", "/tmp/synapse-tls")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.TLS.Enabled {
+		t.Fatal("env tls enabled override failed")
+	}
+	if cfg.Server.TLS.AutoDir != "/tmp/synapse-tls" {
+		t.Fatalf("env auto_dir override failed: %q", cfg.Server.TLS.AutoDir)
+	}
+	want := []string{"other.example.com", "10.9.8.7"}
+	if len(cfg.Server.TLS.SANs) != len(want) || cfg.Server.TLS.SANs[0] != want[0] || cfg.Server.TLS.SANs[1] != want[1] {
+		t.Fatalf("env sans override failed: %v", cfg.Server.TLS.SANs)
+	}
+}
+
+func TestValidate_TLSErrors(t *testing.T) {
+	cert := filepath.Join(t.TempDir(), "cert.pem")
+	if err := os.WriteFile(cert, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"cert without key", func(c *Config) {
+			c.Server.TLS = TLS{Enabled: true, CertFile: cert}
+		}, "must be set together"},
+		{"key without cert", func(c *Config) {
+			c.Server.TLS = TLS{Enabled: true, KeyFile: cert}
+		}, "must be set together"},
+		{"missing file", func(c *Config) {
+			c.Server.TLS = TLS{Enabled: true, CertFile: "/nonexistent/cert.pem", KeyFile: "/nonexistent/key.pem"}
+		}, "is not readable"},
+		{"files but disabled", func(c *Config) {
+			c.Server.TLS = TLS{CertFile: cert, KeyFile: cert}
+		}, "enabled is false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			tc.mut(&cfg)
+			err := Validate(&cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
+			}
+		})
+	}
+
+	// Present, readable files with enabled validate cleanly.
+	cfg := Defaults()
+	cfg.Server.TLS = TLS{Enabled: true, CertFile: cert, KeyFile: cert}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("valid tls config rejected: %v", err)
+	}
+}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -46,10 +47,20 @@ func Status(configPath string) error {
 		probeHost = "127.0.0.1"
 	}
 	fmt.Printf("listen:    %s\n", cfg.Server.Listen)
+	if cfg.Server.TLS.Enabled {
+		fmt.Printf("tls:       enabled\n")
+	}
 	fmt.Printf("upstream:  %s (%s)\n", cfg.Upstream.BaseURL, cfg.Upstream.ResponsesMode)
 
+	scheme := "http"
 	client := &http.Client{Timeout: 3 * time.Second}
-	base := fmt.Sprintf("http://%s", net.JoinHostPort(probeHost, port))
+	if cfg.Server.TLS.Enabled {
+		scheme = "https"
+		// Self-probe of this machine's own daemon: liveness only, so the
+		// (possibly auto-generated) certificate is not verified.
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	base := fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(probeHost, port))
 	for _, probe := range []struct{ name, path string }{
 		{"health", "/health"},
 		{"ready", "/ready"},

@@ -7,6 +7,24 @@ server:
   # Listen address. 0.0.0.0 exposes the proxy to the LAN (see README:
   # Security). Use 127.0.0.1 to restrict to localhost.
   listen: "0.0.0.0:8787"
+  # Serve HTTPS instead of HTTP on the listen address — for agents whose
+  # base_url must be https://. Independent of the upstream scheme:
+  # upstream.base_url keeps its own http:// or https://.
+  tls:
+    enabled: false
+    # Bring your own certificate (Let's Encrypt, internal CA, mkcert):
+    # both files must be set together; nothing is generated when set.
+    # cert_file: /path/to/cert.pem
+    # key_file: /path/to/key.pem
+    # Without cert/key files a self-signed CA + server certificate is
+    # generated on first start and persisted here (default:
+    # ~/.config/synapse/tls). Import the generated ca.pem into the
+    # clients' trust store once (see README: HTTPS).
+    # auto_dir: /var/lib/synapse/tls
+    # Extra DNS names / IPs for the generated certificate's SANs. The
+    # defaults already cover localhost, the machine hostname, and every
+    # interface IP; add names clients will use in their base_url.
+    # sans: ["mybox.example.com"]
 
 upstream:
   # Base URL of the OpenAI-compatible chat completions provider.
@@ -41,7 +59,10 @@ log:
   level: info         # debug | info | warn | error
 
 # Every value above can be overridden via environment variables:
-#   PROXY_SERVER_LISTEN, PROXY_UPSTREAM_BASE_URL, PROXY_UPSTREAM_PATH,
+#   PROXY_SERVER_LISTEN, PROXY_SERVER_TLS_ENABLED,
+#   PROXY_SERVER_TLS_CERT_FILE, PROXY_SERVER_TLS_KEY_FILE,
+#   PROXY_SERVER_TLS_AUTO_DIR, PROXY_SERVER_TLS_SANS (comma-separated),
+#   PROXY_UPSTREAM_BASE_URL, PROXY_UPSTREAM_PATH,
 #   PROXY_LIMITS_MAX_CONCURRENCY, PROXY_LIMITS_MAX_BODY_BYTES,
 #   PROXY_TIMEOUTS_CONNECT, PROXY_TIMEOUTS_REQUEST, PROXY_TIMEOUTS_IDLE,
 #   PROXY_TIMEOUTS_STREAM_WRITE, PROXY_SHUTDOWN_TIMEOUT,
