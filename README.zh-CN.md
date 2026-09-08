@@ -7,7 +7,7 @@
 ```
 Client / Codex / Agent              (Responses API)
         |
-        |  POST /v1/responses
+        |  POST /v1/responses   (http:// 或 https://)
         v
 +-------------------------------------------+
 |         synapse-protocol-adapter          |
@@ -16,9 +16,10 @@ Client / Codex / Agent              (Responses API)
 |   Streaming SSE 转换                      |
 |   Tool-call 转换                          |
 |   Header 透传                             |
+|   可选 TLS 监听                           |
 +-------------------------------------------+
         |
-        |  POST /v1/chat/completions
+        |  POST /v1/chat/completions   (http:// 或 https://)
         v
 Custom LLM Provider                 (Chat Completions API)
 ```
@@ -31,6 +32,7 @@ Custom LLM Provider                 (Chat Completions API)
 - ✅ 客户端的 `Authorization` 及其他 header **原样透传**到 upstream
 - ✅ 真正逐 chunk 的 SSE 流式转换，逐事件 flush
 - ✅ 客户端断开立即取消 upstream 请求
+- ✅ 可选 HTTPS 监听（`server.tls`）——自动生成自签名 CA 或自带证书，供强制 `https://` base_url 的 agent 使用
 - ✅ 单静态二进制 · Docker · systemd · SIGTERM 优雅退出
 
 ## 架构
@@ -57,6 +59,8 @@ Custom LLM Provider                 (Chat Completions API)
   ◀─────────────────────┼──│ writer     │    │ reader     │    │ (header 过滤,      │   │◀──────────────────
    逐事件 flush          │  │ (逐事件flush)│   │ (抗拆分)    │    │  keep-alive 连接池)│   │
                         │  └────────────┘    └────────────┘    └────────────────────┘   │
+                        │  listener: 明文 HTTP 或 TLS 终结 (HTTP/2):                     │
+                        │  自动自签 CA 或自带证书 (server.tls)                           │
                         │  middleware: request-id -> access-log -> recover               │
                         │  运维面: /health /ready /metrics   生命周期: graceful shutdown  │
                         └───────────────────────────────────────────────────────────────┘
@@ -121,7 +125,9 @@ curl -LO https://github.com/dncore/synapse-protocol-adapter/releases/latest/down
 chmod +x synapse-linux-x64 && ./synapse-linux-x64 --version
 ```
 
-随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`。
+随后把任意 Responses API 客户端指向 `http://<host>:8787/v1`——打开
+`server.tls.enabled: true` 即变 `https://`（见
+[HTTPS 监听](#https-监听-tls)）。
 
 ## 运行 daemon 的三种方式
 
@@ -569,6 +575,9 @@ base_url = "http://192.168.1.100:8787/v1"
 wire_api = "responses"
 ```
 
+Agent 强制 `https://`？打开 `server.tls.enabled: true`，base_url 换成
+`https://…` 即可——见 [HTTPS 监听](#https-监听-tls)。
+
 ## curl 示例
 
 非流式：
@@ -653,8 +662,9 @@ make race    # 同上，开启 race detector
 
 测试覆盖：转换器表驱动用例、逐字节喂入的 SSE 拆分解析、UTF-8 拆分
 边界、并行 tool call 的流式事件序列、Authorization 透传、客户端断开的
-取消传导、upstream 错误转发、shutdown 时 readiness 翻转、10/50/100/200
-并发。
+取消传导、upstream 错误转发、shutdown 时 readiness 翻转、TLS 端到端
+（用生成的 CA 验证握手：受信客户端正常服务、不受信客户端在握手阶段被
+拒）、10/50/100/200 并发。
 
 ## 故障排查
 
@@ -666,6 +676,8 @@ make race    # 同上，开启 race detector
 | `400 unsupported input item type` | 客户端发送了 chat-completions 无对应的 item 类型（如 `computer_call`）。 |
 | 流恰好在 5 分钟处被切断 | 慢客户端触发 `timeouts.stream_write`；合理场景可调大。 |
 | 客户端解析不到 tool call | provider 必须以 `delta.tool_calls[].index` 形式输出（标准 OpenAI 形状）；检查 provider 是否启用 tools。 |
+| `curl: (60) SSL certificate problem` | 客户端不信任自动生成的 CA——导入 `~/.config/synapse/tls/ca.pem`（见 [HTTPS 监听](#https-监听-tls)），或用 `--cacert`/`NODE_EXTRA_CA_CERTS`。 |
+| agent 报 https 证书错误 | 同上；走系统信任库的 agent 必须导入 CA，环境变量方式只对支持它的运行时有效。 |
 
 ## 安全说明
 

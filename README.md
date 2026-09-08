@@ -10,7 +10,7 @@ Responses-API agent) at it, run any chat-completions backend behind it.
 ```
 Client / Codex / Agent              (speaks Responses API)
         |
-        |  POST /v1/responses
+        |  POST /v1/responses   (http:// or https://)
         v
 +-------------------------------------------+
 |         synapse-protocol-adapter          |
@@ -19,9 +19,10 @@ Client / Codex / Agent              (speaks Responses API)
 |   Streaming SSE conversion                |
 |   Tool-call conversion                    |
 |   Header passthrough                      |
+|   Optional TLS listener                   |
 +-------------------------------------------+
         |
-        |  POST /v1/chat/completions
+        |  POST /v1/chat/completions   (http:// or https://)
         v
 Custom LLM Provider                 (speaks Chat Completions API)
 ```
@@ -34,6 +35,7 @@ It is a **transparent protocol adapter** — nothing more:
 - ✅ Forwards client `Authorization` and all other headers **verbatim** to upstream
 - ✅ True chunk-by-chunk SSE streaming with immediate flush
 - ✅ Client disconnect cancels the upstream request immediately
+- ✅ Optional HTTPS listener (`server.tls`) — auto-generated self-signed CA or bring-your-own cert, for agents that require `https://` base URLs
 - ✅ Single static binary · Docker · systemd · graceful drain on SIGTERM
 
 ## Architecture
@@ -62,6 +64,8 @@ It is a **transparent protocol adapter** — nothing more:
    flushed per event    │  │ (flush/evt)│    │ (split-    │    │   keep-alive pool) │   │
                         │  └────────────┘    │  safe)     │    └────────────────────┘   │
                         │                    └────────────┘                             │
+                        │  listener: plain HTTP - or TLS terminator (HTTP/2):            │
+                        │  auto self-signed CA or your cert (server.tls)                 │
                         │  middleware: request-id -> access-log -> recover               │
                         │  ops: /health /ready /metrics   lifecycle: graceful shutdown   │
                         └───────────────────────────────────────────────────────────────┘
@@ -129,7 +133,9 @@ curl -LO https://github.com/dncore/synapse-protocol-adapter/releases/latest/down
 chmod +x synapse-linux-x64 && ./synapse-linux-x64 --version
 ```
 
-Then point any Responses-API client at `http://<host>:8787/v1`.
+Then point any Responses-API client at `http://<host>:8787/v1` — or
+`https://` by flipping `server.tls.enabled: true` (see
+[HTTPS listener](#https-listener-tls)).
 
 ## Running the daemon
 
@@ -597,6 +603,9 @@ base_url = "http://192.168.1.100:8787/v1"
 wire_api = "responses"
 ```
 
+Agent insisting on `https://`? Flip `server.tls.enabled: true` and use
+`base_url = "https://…"` — see [HTTPS listener (TLS)](#https-listener-tls).
+
 ## curl examples
 
 Non-streaming:
@@ -683,7 +692,8 @@ The suite covers converter tables, SSE parsing under one-byte-per-read
 segmentation, UTF-8 split boundaries, streaming event sequences with
 parallel tool calls, Authorization passthrough, client-disconnect
 cancellation propagation, upstream error relay, readiness flip on
-shutdown, and 10/50/100/200-way concurrency.
+shutdown, TLS e2e against the generated CA (trusted clients served,
+untrusted rejected at the handshake), and 10/50/100/200-way concurrency.
 
 ## Troubleshooting
 
@@ -695,6 +705,8 @@ shutdown, and 10/50/100/200-way concurrency.
 | `400 unsupported input item type` | Client sent item types with no chat-completions equivalent (e.g. `computer_call`). |
 | Streams cut at exactly 5 min | `timeouts.stream_write` hit on a stalled client; raise if legitimate. |
 | Tool calls not parsed by client | Provider must emit `delta.tool_calls[].index` (standard OpenAI shape); check tools are enabled on the provider. |
+| `curl: (60) SSL certificate problem` | The auto-generated CA is not trusted by the client — import `~/.config/synapse/tls/ca.pem` (see [HTTPS listener](#https-listener-tls)) or pass `--cacert`/`NODE_EXTRA_CA_CERTS`. |
+| Agent rejects `https://` with cert error | Same as above; agents using the system store need the CA imported, env-var overrides only work for runtimes that honor them. |
 
 ## Security notes
 
