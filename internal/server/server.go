@@ -45,6 +45,9 @@ type Server struct {
 	ready   atomic.Bool
 	sem     chan struct{}
 	httpSrv *http.Server
+	// tlsCert is the currently served certificate; swapped atomically on
+	// SIGHUP so GetCertificate always hands out a consistent one.
+	tlsCert atomic.Pointer[tls.Certificate]
 }
 
 // New constructs the server. Call Run to start it.
@@ -80,6 +83,12 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	// hit /api/anthropic/*; gateways mount that protocol beside the
 	// chat-completions base, so it forwards host-root-preserved.
 	mux.HandleFunc("/api/anthropic/", s.handlePassthrough)
+	// TLS bootstrap surface: the generated CA for download and a per-OS
+	// import walkthrough. Read-only, registered only when TLS is on.
+	if cfg.Server.TLS.Enabled {
+		mux.HandleFunc("GET /ca.pem", s.handleCACert)
+		mux.HandleFunc("GET /tls-help", s.handleTLSHelp)
+	}
 
 	// Middleware order (outermost first): RequestID assigns the ID so every
 	// inner layer (including logs and panics) can reference it; AccessLog
@@ -122,24 +131,28 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("server.tls: %w", err)
 		}
+		s.tlsCert.Store(&mat.Certificate)
+		// The certificate is served through GetCertificate so a SIGHUP can
+		// swap it without a restart; ServeTLS still enables HTTP/2.
 		s.httpSrv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{mat.Certificate},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion: tls.VersionTLS12,
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if c := s.tlsCert.Load(); c != nil {
+					return c, nil
+				}
+				return nil, errors.New("tls certificate not loaded")
+			},
 		}
-		source := "cert " + s.cfg.Server.TLS.CertFile
-		if s.cfg.Server.TLS.CertFile == "" {
-			source = "auto (" + mat.CACertPath + ")"
-			if mat.GeneratedCA {
-				s.logger.Info("generated self-signed CA — import it into clients' trust stores (once)",
-					"ca", mat.CACertPath,
-					"linux_debian_ubuntu", "sudo cp "+mat.CACertPath+" /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates",
-					"linux_fedora_arch", "sudo trust anchor --store "+mat.CACertPath,
-					"macos", "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "+mat.CACertPath,
-					"curl", "--cacert "+mat.CACertPath,
-					"node", "NODE_EXTRA_CA_CERTS="+mat.CACertPath,
-					"python", "REQUESTS_CA_BUNDLE="+mat.CACertPath,
-				)
-			}
+		source := matSource(s.cfg.Server.TLS, mat)
+		if mat.GeneratedCA {
+			s.logger.Info("generated self-signed CA — import it into clients' trust stores (once)",
+				"ca", mat.CACertPath,
+				"help", "http(s)://<host>:<port>/tls-help walks every platform through it",
+				"download", "GET /ca.pem",
+				"curl", "--cacert "+mat.CACertPath,
+				"node", "NODE_EXTRA_CA_CERTS="+mat.CACertPath,
+				"python", "REQUESTS_CA_BUNDLE="+mat.CACertPath,
+			)
 		}
 		s.logger.Info("tls enabled", "source", source)
 	}
@@ -158,8 +171,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		// ServeTLS with empty file names serves TLSConfig.Certificates and
-		// enables HTTP/2; plain Serve stays HTTP/1.1-only.
+		// ServeTLS with empty file names serves TLSConfig.Certificates /
+		// GetCertificate and enables HTTP/2; plain Serve stays HTTP/1.1.
 		if s.cfg.Server.TLS.Enabled {
 			errCh <- s.httpSrv.ServeTLS(ln, "", "")
 			return
@@ -167,20 +180,57 @@ func (s *Server) Run(ctx context.Context) error {
 		errCh <- s.httpSrv.Serve(ln)
 	}()
 
-	sigCh := make(chan os.Signal, 2)
+	sigCh := make(chan os.Signal, 3)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	select {
-	case sig := <-sigCh:
-		s.logger.Info("shutdown signal received", "signal", sig.String())
-	case <-ctx.Done():
-		s.logger.Info("context canceled, shutting down")
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
+	if s.cfg.Server.TLS.Enabled {
+		// SIGHUP reloads TLS material (re-signed leaf, new SANs) without
+		// draining; `synapse tls add` sends it.
+		signal.Notify(sigCh, syscall.SIGHUP)
 	}
-	return s.Shutdown()
+	for {
+		shutdown := false
+		select {
+		case sig := <-sigCh:
+			if sig == syscall.SIGHUP {
+				s.reloadTLS()
+				continue
+			}
+			s.logger.Info("shutdown signal received", "signal", sig.String())
+			shutdown = true
+		case <-ctx.Done():
+			s.logger.Info("context canceled, shutting down")
+			shutdown = true
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		}
+		if shutdown {
+			return s.Shutdown()
+		}
+	}
+}
+
+// reloadTLS re-reads the TLS material (which re-signs the leaf when SANs
+// or host addresses drifted) and swaps the served certificate atomically.
+// In-flight connections keep the certificate they negotiated.
+func (s *Server) reloadTLS() {
+	mat, err := tlscert.Load(s.cfg.Server.TLS)
+	if err != nil {
+		s.logger.Error("tls reload failed, keeping current certificate", "err", err.Error())
+		return
+	}
+	s.tlsCert.Store(&mat.Certificate)
+	s.logger.Info("tls certificate reloaded", "source", matSource(s.cfg.Server.TLS, mat))
+}
+
+// matSource names the certificate provenance for logs.
+func matSource(cfg config.TLS, mat tlscert.Material) string {
+	if cfg.CertFile != "" {
+		return "cert " + cfg.CertFile
+	}
+	return "auto (" + mat.CACertPath + ")"
 }
 
 // Shutdown flips ready to false, stops accepting connections, waits for

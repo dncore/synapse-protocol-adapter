@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,7 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 	"github.com/dncore/synapse-protocol-adapter/internal/server"
 	"github.com/dncore/synapse-protocol-adapter/internal/service"
+	"github.com/dncore/synapse-protocol-adapter/internal/tlscert"
 )
 
 var version = "dev"
@@ -74,6 +76,12 @@ func main() {
 		case "service":
 			if err := runService(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "service failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "tls":
+			if err := runTLS(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "tls failed: %v\n", err)
 				os.Exit(1)
 			}
 			return
@@ -133,6 +141,11 @@ Usage:
                                        install as an autostart service
                                        (systemd user unit / launchd agent)
   synapse service uninstall            remove the service (keeps config)
+  synapse tls add [--config PATH] <name>...
+                                       add a DNS name/IP to the listener
+                                       certificate (re-signs the leaf under
+                                       the same CA, live via SIGHUP)
+  synapse tls list [--config PATH]     show CA, SAN registry, leaf SANs
   synapse check-config [--config PATH] validate a config and exit
   synapse healthcheck [--url URL] [--config PATH]
                                        probe a running daemon (Docker HEALTHCHECK);
@@ -279,6 +292,87 @@ func runHealthcheck(args []string) error {
 		return fmt.Errorf("health endpoint returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// runTLS manages the listener certificate's dynamic SAN registry:
+//
+//	synapse tls add <name>...   add DNS names / IPs, re-sign the leaf,
+//	                            SIGHUP the daemon (live, no drain)
+//	synapse tls list            show CA, registry, leaf SANs and expiry
+func runTLS(args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: synapse tls add [--config PATH] <name>...\n       synapse tls list [--config PATH]\n       (flags go before the names)")
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("tls "+sub, flag.ContinueOnError)
+	configPath := fs.String("config", defaultServiceConfig(), "config file the daemon runs with")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	path := *configPath
+	if _, err := os.Stat(path); err != nil {
+		path = "" // absent: fall back to defaults + env
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	switch sub {
+	case "add":
+		if !cfg.Server.TLS.Enabled {
+			return errors.New("server.tls.enabled is false — nothing to manage")
+		}
+		if fs.NArg() == 0 {
+			return errors.New("no names given: synapse tls add <dns-or-ip>...")
+		}
+		added, err := tlscert.AddSANs(cfg.Server.TLS, fs.Args())
+		if err != nil {
+			return err
+		}
+		if len(added) == 0 {
+			fmt.Println("nothing to add — all names already covered")
+			return nil
+		}
+		for _, n := range added {
+			fmt.Println("added:", n)
+		}
+		if service.HUP() {
+			fmt.Println("daemon signaled (SIGHUP) — re-signed certificate is live")
+		} else {
+			fmt.Println("daemon not detected — apply with `synapse restart` after starting it")
+		}
+		return nil
+
+	case "list":
+		info := tlscert.Describe(cfg.Server.TLS)
+		fmt.Printf("mode:      %s\n", info.Mode)
+		if info.Mode == "disabled" {
+			return nil
+		}
+		if info.Dir != "" {
+			fmt.Printf("dir:       %s\n", info.Dir)
+		}
+		fmt.Printf("ca:        %s\n", info.CACertPath)
+		if info.RegistryPath != "" {
+			fmt.Printf("registry:  %s (%d entries)\n", info.RegistryPath, len(info.Registry))
+			for _, s := range info.Registry {
+				fmt.Printf("  - %s\n", s)
+			}
+		}
+		if !info.LeafNotAfter.IsZero() {
+			days := int(time.Until(info.LeafNotAfter).Hours() / 24)
+			fmt.Printf("leaf expires: %s (%dd)\n", info.LeafNotAfter.Format("2006-01-02"), days)
+			fmt.Printf("leaf DNS:  %s\n", strings.Join(info.DNSNames, ", "))
+			fmt.Printf("leaf IPs:  %s\n", strings.Join(info.IPs, ", "))
+		}
+		fmt.Println("download:  curl -k https://<host>:<port>/ca.pem   (tutorial: /tls-help)")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown tls subcommand %q (want add|list)", sub)
+	}
 }
 
 func newLogger(cfg config.Log) *slog.Logger {

@@ -15,7 +15,9 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ErrUnsupported is returned on platforms without service support.
@@ -280,4 +282,41 @@ func Restart() error {
 
 func guiDomain() string {
 	return fmt.Sprintf("gui/%d", os.Getuid())
+}
+
+// HUP sends SIGHUP to the running daemon so it reloads TLS material
+// (re-signed certificates, new SANs) without draining connections. It
+// reports whether a running daemon was actually signaled.
+func HUP() bool {
+	pid := daemonPID()
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, syscall.SIGHUP) == nil
+}
+
+// daemonPID asks the platform service manager for the daemon's PID
+// (0 = not running / unsupported).
+func daemonPID() int {
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("launchctl", "print", guiDomain()+"/"+LaunchdLabel).Output()
+		if err != nil {
+			return 0
+		}
+		fields := strings.Fields(string(out))
+		for i := 0; i+2 < len(fields); i++ {
+			if fields[i] == "pid" && fields[i+1] == "=" {
+				if pid, err := strconv.Atoi(fields[i+2]); err == nil {
+					return pid
+				}
+			}
+		}
+		return 0
+	}
+	out, err := exec.Command("systemctl", "--user", "show", ServiceName, "-p", "MainPID", "--value").Output()
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+	return pid
 }

@@ -232,3 +232,142 @@ func containsStr(list []string, s string) bool {
 	}
 	return false
 }
+
+// Adding a SAN via the registry re-signs the leaf under the same CA, and
+// the next Load (daemon SIGHUP/restart) picks it up — no file deletion.
+func TestAddSANsResignsLeaf(t *testing.T) {
+	dir := t.TempDir()
+	cfg := autoCfg(dir)
+	first, err := Load(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added, err := AddSANs(cfg, []string{"new.example.com", "192.0.2.99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != 2 {
+		t.Fatalf("want 2 added, got %v", added)
+	}
+
+	second, err := Load(cfg) // what a SIGHUP reload executes
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.GeneratedCA {
+		t.Error("CA must not regenerate when adding SANs")
+	}
+	if string(first.Certificate.Certificate[0]) == string(second.Certificate.Certificate[0]) {
+		t.Fatal("leaf was not re-signed")
+	}
+	leaf := leafOf(t, second.Certificate)
+	if !containsDNS(leaf, "new.example.com") || !containsIP(leaf, "192.0.2.99") {
+		t.Errorf("new SANs missing: %v %v", leaf.DNSNames, leaf.IPAddresses)
+	}
+	_, pool := loadCA(t, second.CACertPath)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		t.Fatalf("re-signed leaf does not verify against original CA: %v", err)
+	}
+
+	// Registry persisted; adding the same name again is a no-op.
+	if added, err = AddSANs(cfg, []string{"new.example.com"}); err != nil || len(added) != 0 {
+		t.Fatalf("duplicate add must be a no-op, got %v err=%v", added, err)
+	}
+	reg, err := readSANRegistry(dir)
+	if err != nil || len(reg) != 2 {
+		t.Fatalf("registry wrong: %v err=%v", reg, err)
+	}
+}
+
+// A leaf missing a required SAN (edited straight into config.yaml) is
+// re-signed on plain Load — the manual-edit path self-heals too.
+func TestLoadSelfHealsMissingSAN(t *testing.T) {
+	dir := t.TempDir()
+	cfg := autoCfg(dir)
+	if _, err := Load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SANs = append(cfg.SANs, "edited.example.com")
+	mat, err := Load(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsDNS(leafOf(t, mat.Certificate), "edited.example.com") {
+		t.Fatal("config sans addition did not re-sign the leaf")
+	}
+}
+
+// AddSANs before the first start: registry is saved, no material exists
+// yet, and the first Load generates everything including registry names.
+func TestAddSANsBeforeFirstStart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := autoCfg(dir)
+	added, err := AddSANs(cfg, []string{"early.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != 1 {
+		t.Fatalf("added: %v", added)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ca.pem")); !os.IsNotExist(err) {
+		t.Fatal("AddSANs must not generate material before first start")
+	}
+	mat, err := Load(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsDNS(leafOf(t, mat.Certificate), "early.example.com") {
+		t.Fatal("registry SAN missing from generated leaf")
+	}
+}
+
+func TestAddSANsValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := autoCfg(dir)
+	if _, err := AddSANs(cfg, []string{"bad name!"}); err == nil {
+		t.Error("invalid name accepted")
+	}
+	files := config.TLS{Enabled: true, CertFile: "c.pem", KeyFile: "k.pem"}
+	if _, err := AddSANs(files, []string{"ok.example.com"}); err == nil {
+		t.Error("files mode must reject registry additions")
+	}
+}
+
+func TestValidateSANName(t *testing.T) {
+	valid := []string{"a.example.com", "*.example.com", "box", "T165", "192.0.2.1", "::1", "xn--e1afmkfd.xn--p1ai"}
+	invalid := []string{"", "bad name", "-lead.example.com", "trail-.example.com", "a..b", "*.example.com.", "ok\ninjected"}
+	for _, s := range valid {
+		if !ValidateSANName(s) {
+			t.Errorf("want valid: %q", s)
+		}
+	}
+	for _, s := range invalid {
+		if ValidateSANName(s) {
+			t.Errorf("want invalid: %q", s)
+		}
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	dir := t.TempDir()
+	cfg := autoCfg(dir)
+	if _, err := Load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = AddSANs(cfg, []string{"listed.example.com"})
+
+	info := Describe(cfg)
+	if info.Mode != "auto" || info.Dir != dir || info.CACertPath != filepath.Join(dir, "ca.pem") {
+		t.Fatalf("mode/dir wrong: %+v", info)
+	}
+	if info.LeafNotAfter.IsZero() || !containsStr(info.Registry, "listed.example.com") {
+		t.Fatalf("leaf/registry missing: %+v", info)
+	}
+	if !containsStr(info.DNSNames, "localhost") {
+		t.Fatalf("leaf SANs missing: %v", info.DNSNames)
+	}
+	if d := Describe(config.TLS{}); d.Mode != "disabled" {
+		t.Fatalf("disabled mode wrong: %+v", d)
+	}
+}

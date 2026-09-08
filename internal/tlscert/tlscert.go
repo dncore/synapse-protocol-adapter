@@ -21,6 +21,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
@@ -36,6 +38,13 @@ const (
 	renewWithin  = 30 * 24 * time.Hour
 )
 
+// sansFileName is the dynamic SAN registry beside the certificates: one
+// DNS name or IP per line ('#' starts a comment). It is the mutable
+// counterpart to the declarative server.tls.sans in config.yaml; the
+// effective SAN set is the union of both, so neither channel can lose
+// entries at renewal time.
+const sansFileName = "sans"
+
 // now is swappable so tests can simulate certificate expiry.
 var now = time.Now
 
@@ -50,9 +59,20 @@ type Material struct {
 	GeneratedCA bool
 }
 
+// resolveDir is the single AutoDir→default resolution shared by every
+// entry point.
+func resolveDir(cfg config.TLS) (string, error) {
+	if cfg.AutoDir != "" {
+		return cfg.AutoDir, nil
+	}
+	return DefaultDir()
+}
+
 // Load returns the listener certificate: the configured files when set,
 // otherwise the persisted auto-generated pair under AutoDir, generating or
-// renewing as needed.
+// renewing as needed. The effective SAN set (config ∪ registry) is the
+// coverage requirement: an existing leaf missing any required SAN is
+// re-signed under the same CA, so adding names needs no manual deletion.
 func Load(cfg config.TLS) (Material, error) {
 	if cfg.CertFile != "" || cfg.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -61,15 +81,15 @@ func Load(cfg config.TLS) (Material, error) {
 		}
 		return Material{Certificate: cert}, nil
 	}
-	dir := cfg.AutoDir
-	if dir == "" {
-		var err error
-		dir, err = DefaultDir()
-		if err != nil {
-			return Material{}, err
-		}
+	dir, err := resolveDir(cfg)
+	if err != nil {
+		return Material{}, err
 	}
-	return ensureGenerated(dir, cfg.SANs)
+	sans, err := EffectiveSANs(cfg)
+	if err != nil {
+		return Material{}, err
+	}
+	return ensureGenerated(dir, sans)
 }
 
 // DefaultDir mirrors service.DetectPaths so the generated certificates
@@ -139,12 +159,14 @@ func ensureGenerated(dir string, sans []string) (Material, error) {
 		}
 	}
 
-	// Existing leaf: reuse when verifiable against the CA and not close to
-	// expiry; renew otherwise. SAN changes only apply at (re)generation —
-	// documented behavior, not worth a restart loop.
+	// Existing leaf: reuse when it chains to the CA, has renewal headroom,
+	// and covers every required SAN. Anything else (expiry, hostname/IP
+	// drift, a registry addition) re-signs the leaf — the CA and the trust
+	// clients imported stay untouched.
+	dnsNames, ips := collectSANs(sans)
 	if certPEMBytes, keyPEMBytes, err := readPair(certPath, keyPath); err == nil {
 		leaf, err := tls.X509KeyPair(certPEMBytes, keyPEMBytes)
-		if err == nil && leafIsValid(leaf, caCert) {
+		if err == nil && leafSufficient(leaf, caCert, dnsNames, ips) {
 			return Material{
 				Certificate: leaf,
 				CACertPath:  caPath,
@@ -153,7 +175,6 @@ func ensureGenerated(dir string, sans []string) (Material, error) {
 		}
 	}
 
-	dnsNames, ips := collectSANs(sans)
 	leaf, err := generateLeaf(caCert, caKey, dnsNames, ips)
 	if err != nil {
 		return Material{}, err
@@ -187,6 +208,36 @@ func leafIsValid(pair tls.Certificate, ca *x509.Certificate) bool {
 		return false
 	}
 	return now().Add(renewWithin).Before(cert.NotAfter)
+}
+
+// leafSufficient is the reuse gate: valid chain + headroom + every
+// required DNS name and IP present in the SAN extension.
+func leafSufficient(pair tls.Certificate, ca *x509.Certificate, dnsNames []string, ips []net.IP) bool {
+	if !leafIsValid(pair, ca) {
+		return false
+	}
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return false
+	}
+	for _, d := range dnsNames {
+		if !slices.Contains(cert.DNSNames, d) {
+			return false
+		}
+	}
+	for _, ip := range ips {
+		found := false
+		for _, c := range cert.IPAddresses {
+			if c.Equal(ip) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // --- generation ---
@@ -348,4 +399,250 @@ func readPair(certPath, keyPath string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 	return certBytes, keyBytes, nil
+}
+
+// --- dynamic SAN registry ---
+
+// readSANRegistry loads auto_dir/sans. A missing file is an empty
+// registry, not an error.
+func readSANRegistry(dir string) ([]string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, sansFileName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var sans []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0]); line != "" {
+			sans = append(sans, line)
+		}
+	}
+	return sans, nil
+}
+
+// writeSANRegistry persists the registry atomically (write temp + rename)
+// so a concurrent daemon reload never observes a partial file.
+func writeSANRegistry(dir string, sans []string) error {
+	var sb strings.Builder
+	for _, s := range sans {
+		sb.WriteString(s)
+		sb.WriteByte('\n')
+	}
+	return atomicWrite(filepath.Join(dir, sansFileName), []byte(sb.String()), 0o644)
+}
+
+func atomicWrite(path string, b []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// EffectiveSANs merges the declarative config sans with the dynamic
+// registry (config first), deduplicated, order-preserving.
+func EffectiveSANs(cfg config.TLS) ([]string, error) {
+	dir, err := resolveDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+	reg, err := readSANRegistry(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read sans registry: %w", err)
+	}
+	seen := make(map[string]bool, len(cfg.SANs)+len(reg))
+	var out []string
+	for _, s := range append(slices.Clone(cfg.SANs), reg...) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// ValidateSANName reports whether s is usable as a SAN entry: an IP
+// address or an RFC 1123 DNS name, optionally with a "*." wildcard label.
+func ValidateSANName(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	if strings.HasPrefix(s, "*.") {
+		s = s[2:]
+	}
+	if s == "" {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '-':
+				if i == 0 || i == len(label)-1 {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// AddSANs validates names, appends the new ones to the dynamic registry,
+// and re-signs the server certificate under the existing CA so a daemon
+// reload (SIGHUP) or restart serves them immediately. The CA is never
+// touched: client-side imported trust survives every change. Returns the
+// names actually added (already-known names are skipped).
+func AddSANs(cfg config.TLS, names []string) ([]string, error) {
+	if cfg.CertFile != "" || cfg.KeyFile != "" {
+		return nil, errors.New("server.tls.cert_file mode: SANs live in the provided certificate, not the registry")
+	}
+	for _, n := range names {
+		if !ValidateSANName(n) {
+			return nil, fmt.Errorf("%q is not a valid DNS name or IP address", n)
+		}
+	}
+	dir, err := resolveDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+	effective, err := EffectiveSANs(cfg)
+	if err != nil {
+		return nil, err
+	}
+	registry, err := readSANRegistry(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool, len(effective))
+	for _, s := range effective {
+		seen[s] = true
+	}
+	var added []string
+	for _, n := range names {
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		registry = append(registry, n)
+		added = append(added, n)
+	}
+	if len(added) == 0 {
+		return nil, nil
+	}
+	if err := writeSANRegistry(dir, registry); err != nil {
+		return nil, fmt.Errorf("write sans registry: %w", err)
+	}
+
+	// Re-sign immediately when a CA exists; otherwise the registry is
+	// saved and the next start generates everything with the new SANs.
+	caPEM, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if errors.Is(err, os.ErrNotExist) {
+		return added, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ca, err := parseCertificate(caPEM)
+	if err != nil {
+		return nil, err
+	}
+	caKeyPEM, err := os.ReadFile(filepath.Join(dir, "ca-key.pem"))
+	if err != nil {
+		return nil, fmt.Errorf("read ca-key.pem (delete the directory to regenerate): %w", err)
+	}
+	caKey, err := parseECDSAKey(caKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	dnsNames, ips := collectSANs(append(effective, added...))
+	leaf, err := generateLeaf(ca, caKey, dnsNames, ips)
+	if err != nil {
+		return nil, err
+	}
+	if err := writePair(dir,
+		"cert.pem", certPEM(leaf.cert), 0o644,
+		"key.pem", keyPEM(leaf.key), 0o600,
+	); err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// Info is a read-only snapshot for `synapse tls list`.
+type Info struct {
+	Mode         string // "disabled" | "files" | "auto"
+	Dir          string
+	CACertPath   string
+	RegistryPath string
+	Registry     []string
+	LeafNotAfter time.Time // zero when no leaf exists
+	DNSNames     []string
+	IPs          []string
+}
+
+// Describe inspects the material on disk without generating or re-signing
+// anything; missing pieces stay zero-valued.
+func Describe(cfg config.TLS) Info {
+	if !cfg.Enabled {
+		return Info{Mode: "disabled"}
+	}
+	if cfg.CertFile != "" || cfg.KeyFile != "" {
+		info := Info{Mode: "files", CACertPath: cfg.CertFile}
+		if pair, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err == nil && len(pair.Certificate) > 0 {
+			fillLeaf(&info, pair)
+		}
+		return info
+	}
+	dir, err := resolveDir(cfg)
+	if err != nil {
+		return Info{Mode: "auto"}
+	}
+	info := Info{
+		Mode:         "auto",
+		Dir:          dir,
+		CACertPath:   filepath.Join(dir, "ca.pem"),
+		RegistryPath: filepath.Join(dir, sansFileName),
+	}
+	info.Registry, _ = readSANRegistry(dir)
+	if pair, err := tls.LoadX509KeyPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")); err == nil && len(pair.Certificate) > 0 {
+		fillLeaf(&info, pair)
+	}
+	return info
+}
+
+func fillLeaf(info *Info, pair tls.Certificate) {
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return
+	}
+	info.LeafNotAfter = cert.NotAfter
+	info.DNSNames = cert.DNSNames
+	for _, ip := range cert.IPAddresses {
+		info.IPs = append(info.IPs, ip.String())
+	}
+}
+
+// CACertPath returns the CA certificate location in auto mode ("" in
+// files mode — there is no generated CA to download).
+func CACertPath(cfg config.TLS) string {
+	if cfg.CertFile != "" || cfg.KeyFile != "" {
+		return ""
+	}
+	dir, err := resolveDir(cfg)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "ca.pem")
 }

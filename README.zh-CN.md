@@ -202,6 +202,8 @@ provider 复测同样指标。
 | `GET /ready` | 就绪——shutdown 开始即 503 |
 | `GET /metrics` | Prometheus 文本格式 |
 | `GET /version` | 构建版本 |
+| `GET /ca.pem` | 生成的 CA 证书（仅 `server.tls` 自动证书模式）——客户端信任引导 |
+| `GET /tls-help` | 各平台 CA 导入教程页，内嵌本服务地址（仅 `server.tls` 开启时） |
 | `GET /` | 端点列表 |
 
 ### 透明转发（`/v1/chat/completions`、`/v1/models` 等）
@@ -516,16 +518,32 @@ upstream:
 未配置 `cert_file`/`key_file` 时，首次启动会**自动生成自签名 CA 与服务器
 证书**（mkcert 模式，ECDSA P-256，CA 有效期 10 年，叶子证书 825 天、到期
 自动续签），持久化在 `~/.config/synapse/tls/`。证书 SAN 覆盖 `localhost`、
-主机名、所有网卡 IP，以及 `sans:` 追加的条目。客户端需要信任该 CA（一次
-即可）：
+主机名、所有网卡 IP，以及 `sans:` 追加的条目。
+
+### 下载 CA 与导入教程
+
+服务自带 CA 下载和教程页（仅 TLS 模式）：
+
+```bash
+curl -k https://<host>:<port>/ca.pem -o synapse-ca.pem
+```
+
+`-k` 只在这一次引导请求里跳过校验——此刻还没信任 CA，先取回再信任；
+之后的请求都是真校验。然后把
+`https://<host>:<port>/tls-help` 发给需要接入的人：页面按 macOS、
+Debian/Ubuntu、Fedora/Arch、Windows 分别给出导入步骤（含
+`NODE_EXTRA_CA_CERTS`/`REQUESTS_CA_BUNDLE` 这类不改系统信任库的替代
+方案），且内嵌本服务的真实地址，照抄即可。速查：
 
 ```bash
 # Debian/Ubuntu
-sudo cp ~/.config/synapse/tls/ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
+sudo cp synapse-ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
 # Fedora/Arch
-sudo trust anchor --store ~/.config/synapse/tls/ca.pem
-# macOS
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.config/synapse/tls/ca.pem
+sudo trust anchor --store synapse-ca.pem
+# macOS（要在 Mac 上执行——Linux 没有 `security` 命令）
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain synapse-ca.pem
+# Windows（管理员 PowerShell）
+Import-Certificate -FilePath synapse-ca.pem -CertStoreLocation Cert:\LocalMachine\Root
 ```
 
 agent 侧不动系统信任库的替代方案：
@@ -536,6 +554,23 @@ agent 侧不动系统信任库的替代方案：
 | Node（Claude Code 等） | `NODE_EXTRA_CA_CERTS=~/.config/synapse/tls/ca.pem` |
 | Python | `REQUESTS_CA_BUNDLE=~/.config/synapse/tls/ca.pem`（或 `SSL_CERT_FILE`） |
 | Go | `SSL_CERT_FILE=~/.config/synapse/tls/ca.pem` |
+
+### 动态管理 SAN
+
+部署后加域名只需一条命令——叶子证书在**同一个 CA** 下重签（客户端已
+导入的信任不受影响、无需重导），守护进程通过 SIGHUP **即时**换上新证书：
+不重启、不断流：
+
+```bash
+synapse tls add mybox.example.com     # 可重复；域名或 IP
+synapse tls list                      # CA 路径、SAN 注册表、叶子 SAN、有效期
+```
+
+名字累积在证书旁的注册表文件里（`~/.config/synapse/tls/sans`）；生效的
+SAN 集合 = 注册表 + 配置文件里的 `server.tls.sans`，续签时两边都不会
+丢。直接编辑配置里的 `sans:` 再重启效果相同（叶子缺任何必需 SAN、或
+主机 IP 变了，加载时都会自动重签）。守护进程收到 SIGHUP 即重载 TLS
+材料——`synapse tls add` 对已安装服务发的正是这个信号。
 
 已有真证书（内部 CA、DNS 挑战的 Let's Encrypt、mkcert）则跳过生成：
 

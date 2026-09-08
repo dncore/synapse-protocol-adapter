@@ -18,12 +18,17 @@ server:
     # key_file: /path/to/key.pem
     # Without cert/key files a self-signed CA + server certificate is
     # generated on first start and persisted here (default:
-    # ~/.config/synapse/tls). Import the generated ca.pem into the
-    # clients' trust store once (see README: HTTPS).
+    # ~/.config/synapse/tls). Clients fetch the CA with
+    #   curl -k https://<host>:<port>/ca.pem
+    # and follow https://<host>:<port>/tls-help to import it (macOS,
+    # Linux, Windows). Importing once is enough: re-signing the server
+    # certificate keeps the same CA.
     # auto_dir: /var/lib/synapse/tls
     # Extra DNS names / IPs for the generated certificate's SANs. The
     # defaults already cover localhost, the machine hostname, and every
-    # interface IP; add names clients will use in their base_url.
+    # interface IP. After deployment, add names live without editing this
+    # file: `synapse tls add <name>` (re-signs the leaf under the same CA
+    # and SIGHUPs the daemon); `synapse tls list` shows everything.
     # sans: ["mybox.example.com"]
 
 upstream:

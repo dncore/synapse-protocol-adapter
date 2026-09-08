@@ -218,6 +218,8 @@ against your real provider at any time.
 | `GET /ready` | Readiness — 503 once shutdown begins |
 | `GET /metrics` | Prometheus text format |
 | `GET /version` | Build version |
+| `GET /ca.pem` | The generated CA certificate (only with `server.tls` auto mode) — client-trust bootstrap |
+| `GET /tls-help` | Per-OS CA import walkthrough with this daemon's address baked in (only with `server.tls`) |
 | `GET /` | Endpoint listing |
 
 ### Transparent passthrough (`/v1/chat/completions`, `/v1/models`, …)
@@ -539,16 +541,34 @@ With no `cert_file`/`key_file` configured, the first start generates a
 **self-signed CA plus server certificate** (mkcert-style, ECDSA P-256,
 CA valid 10 years, leaf 825 days and renewed automatically) and persists
 both under `~/.config/synapse/tls/`. The leaf covers `localhost`, the
-machine hostname, every interface IP, plus any `sans:` entries. Clients
-must trust the generated CA once:
+machine hostname, every interface IP, plus any `sans:` entries.
+
+### Downloading the CA & the import tutorial
+
+The daemon serves its CA and a walkthrough page (TLS mode only):
+
+```bash
+curl -k https://<host>:<port>/ca.pem -o synapse-ca.pem
+```
+
+`-k` skips verification for that one bootstrap request — you do not
+trust the CA yet, so you fetch it, then trust it; every later request
+verifies for real. Then point whoever needs it at
+`https://<host>:<port>/tls-help`: it renders the import steps for macOS,
+Debian/Ubuntu, Fedora/Arch, and Windows (plus the
+`NODE_EXTRA_CA_CERTS`/`REQUESTS_CA_BUNDLE` no-system-change variants)
+with this daemon's exact address baked in, so nobody has to write or
+guess the commands. Reference for the impatient:
 
 ```bash
 # Debian/Ubuntu
-sudo cp ~/.config/synapse/tls/ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
+sudo cp synapse-ca.pem /usr/local/share/ca-certificates/synapse-ca.crt && sudo update-ca-certificates
 # Fedora/Arch
-sudo trust anchor --store ~/.config/synapse/tls/ca.pem
-# macOS
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.config/synapse/tls/ca.pem
+sudo trust anchor --store synapse-ca.pem
+# macOS (run ON the Mac — `security` does not exist on Linux)
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain synapse-ca.pem
+# Windows (admin PowerShell)
+Import-Certificate -FilePath synapse-ca.pem -CertStoreLocation Cert:\LocalMachine\Root
 ```
 
 Agent-side, without touching the system store:
@@ -559,6 +579,27 @@ Agent-side, without touching the system store:
 | Node (Claude Code etc.) | `NODE_EXTRA_CA_CERTS=~/.config/synapse/tls/ca.pem` |
 | Python | `REQUESTS_CA_BUNDLE=~/.config/synapse/tls/ca.pem` (or `SSL_CERT_FILE`) |
 | Go | `SSL_CERT_FILE=~/.config/synapse/tls/ca.pem` |
+
+### Managing SANs dynamically
+
+Adding a domain after deployment is one command — the leaf is re-signed
+under the **same CA** (imported client trust survives; no re-import) and
+the daemon serves it **live** via SIGHUP, without a restart or drained
+streams:
+
+```bash
+synapse tls add mybox.example.com     # repeatable; DNS names or IPs
+synapse tls list                      # CA path, SAN registry, leaf SANs, expiry
+```
+
+Names accumulate in a registry beside the certificates
+(`~/.config/synapse/tls/sans`); the effective SAN set is that registry
+plus the declarative `server.tls.sans` in the config — neither channel
+can lose entries at renewal. Editing `sans:` in the config and
+restarting does the same thing (a leaf missing any required SAN, or a
+drifted host IP, is re-signed automatically on load). The daemon reloads
+TLS material on SIGHUP, which is exactly what `synapse tls add` sends to
+the installed service.
 
 Already have a real certificate (internal CA, Let's Encrypt via DNS
 challenge, mkcert)? Skip generation entirely:
