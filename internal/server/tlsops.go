@@ -71,10 +71,11 @@ is regenerated (years); re-signing the server certificate (new domains,
 renewal) keeps the same CA and needs <b>no</b> re-import.</p>
 
 <h2>1. Download the CA</h2>
-<pre>curl -k https://%s/ca.pem -o synapse-ca.pem</pre>
-<p class="note"><code>-k</code> skips verification for this one request —
-that is the bootstrap: you do not trust the CA yet, so you fetch it, then
-trust it. All later requests verify for real.</p>
+<pre>curl http://%s/ca.pem -o synapse-ca.pem</pre>
+<p class="note">The gateway serves both plain HTTP and HTTPS on this port
+(auto-detected per connection), so the one request you cannot yet
+verify — fetching the CA — can simply go over HTTP. After importing it
+below, use <code>https://</code> URLs and they verify for real.</p>
 
 <h2>2. Import it — pick your OS</h2>
 

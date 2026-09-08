@@ -7,9 +7,10 @@ server:
   # Listen address. 0.0.0.0 exposes the proxy to the LAN (see README:
   # Security). Use 127.0.0.1 to restrict to localhost.
   listen: "0.0.0.0:8787"
-  # Serve HTTPS instead of HTTP on the listen address — for agents whose
-  # base_url must be https://. Independent of the upstream scheme:
-  # upstream.base_url keeps its own http:// or https://.
+  # Serve HTTP and HTTPS on the listen address at the same time — the
+  # wire protocol is auto-detected per connection, so plain-HTTP clients
+  # keep working while https-only agents get TLS. Independent of the
+  # upstream scheme: upstream.base_url keeps its own http:// or https://.
   tls:
     enabled: false
     # Bring your own certificate (Let's Encrypt, internal CA, mkcert):

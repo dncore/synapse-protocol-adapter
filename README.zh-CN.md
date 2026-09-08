@@ -32,7 +32,7 @@ Custom LLM Provider                 (Chat Completions API)
 - ✅ 客户端的 `Authorization` 及其他 header **原样透传**到 upstream
 - ✅ 真正逐 chunk 的 SSE 流式转换，逐事件 flush
 - ✅ 客户端断开立即取消 upstream 请求
-- ✅ 可选 HTTPS 监听（`server.tls`）——自动生成自签名 CA 或自带证书，供强制 `https://` base_url 的 agent 使用
+- ✅ 监听可选 TLS（`server.tls`）——HTTP 与 HTTPS 同端口共存（按连接自动识别），自动生成自签名 CA 或自带证书，供强制 `https://` base_url 的 agent 使用
 - ✅ 单静态二进制 · Docker · systemd · SIGTERM 优雅退出
 
 ## 架构
@@ -59,8 +59,8 @@ Custom LLM Provider                 (Chat Completions API)
   ◀─────────────────────┼──│ writer     │    │ reader     │    │ (header 过滤,      │   │◀──────────────────
    逐事件 flush          │  │ (逐事件flush)│   │ (抗拆分)    │    │  keep-alive 连接池)│   │
                         │  └────────────┘    └────────────┘    └────────────────────┘   │
-                        │  listener: 明文 HTTP 或 TLS 终结 (HTTP/2):                     │
-                        │  自动自签 CA 或自带证书 (server.tls)                           │
+                        │  listener: 明文 HTTP 或 HTTP+HTTPS 双协议自动探测:             │
+                        │  (server.tls: 自动自签 CA / 自带证书)                          │
                         │  middleware: request-id -> access-log -> recover               │
                         │  运维面: /health /ready /metrics   生命周期: graceful shutdown  │
                         └───────────────────────────────────────────────────────────────┘
@@ -324,7 +324,7 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | 配置项 | 默认值 | 环境变量 | 说明 |
 |---|---|---|---|
 | `server.listen` | `0.0.0.0:8787` | `PROXY_SERVER_LISTEN` | 监听地址；`0.0.0.0` 对局域网开放 |
-| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | 监听端口改用 HTTPS——供强制 `https://` base_url 的 agent 使用（见 [HTTPS 监听](#https-监听-tls)）。与 upstream 的协议无关 |
+| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | 监听端口同时服务 HTTP **与** HTTPS（按连接自动识别）——供强制 `https://` base_url 的 agent 使用（见 [HTTPS 监听](#https-监听-tls)）。与 upstream 的协议无关 |
 | `server.tls.cert_file` / `key_file` | — | `PROXY_SERVER_TLS_CERT_FILE` / `_KEY_FILE` | 自带 PEM 证书（Let's Encrypt、内部 CA、mkcert）；两者须成对设置。不设 = 自动生成自签名 CA |
 | `server.tls.auto_dir` | `~/.config/synapse/tls` | `PROXY_SERVER_TLS_AUTO_DIR` | 生成的 CA 与证书的持久化目录 |
 | `server.tls.sans` | — | `PROXY_SERVER_TLS_SANS`（逗号分隔） | 追加到生成证书 SAN 的域名/IP（默认已覆盖 localhost、主机名、所有网卡 IP） |
@@ -503,8 +503,9 @@ sudo iptables -A INPUT -p tcp --dport 8787 -j ACCEPT                            
 ## HTTPS 监听 (TLS)
 
 有些 agent 强制要求 provider base_url 必须是 `https://`。打开一个开关，
-监听端口即改说 HTTPS——而代理访问 upstream 的方式完全不变，两个方向互相
-独立：
+监听端口即**同时服务 HTTP 与 HTTPS**——按连接自动识别协议：明文 HTTP
+客户端（curl、探针、既有配置）照常工作，要求 https 的 agent 走 TLS。
+代理访问 upstream 的方式完全不变，两个方向互相独立：
 
 ```yaml
 server:
@@ -522,14 +523,14 @@ upstream:
 
 ### 下载 CA 与导入教程
 
-服务自带 CA 下载和教程页（仅 TLS 模式）：
+服务自带 CA 下载和教程页（仅 TLS 模式）。端口同时说明文 HTTP，所以
+这一笔还没法校验的请求——取 CA——直接走 HTTP 即可：
 
 ```bash
-curl -k https://<host>:<port>/ca.pem -o synapse-ca.pem
+curl http://<host>:<port>/ca.pem -o synapse-ca.pem
 ```
 
-`-k` 只在这一次引导请求里跳过校验——此刻还没信任 CA，先取回再信任；
-之后的请求都是真校验。然后把
+导入之后 `https://` 就是真校验。把
 `https://<host>:<port>/tls-help` 发给需要接入的人：页面按 macOS、
 Debian/Ubuntu、Fedora/Arch、Windows 分别给出导入步骤（含
 `NODE_EXTRA_CA_CERTS`/`REQUESTS_CA_BUNDLE` 这类不改系统信任库的替代
@@ -584,7 +585,8 @@ server:
 
 说明：
 
-- TLS 下自动协商 HTTP/2，流式行为完全一致。
+- 两种协议均为 HTTP/1.1：协议探测发生在 TLS 握手之前，本端口不提供
+  h2（所有客户端都能正常协商 1.1）；流式行为完全一致。
 - `synapse status` 与 `synapse healthcheck` 会按配置改走 `https` 探测
   （自探测不校验证书）。Docker 的 `HEALTHCHECK` 无需改动——挂载配置或设
   `PROXY_SERVER_TLS_ENABLED=true` 即可。

@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,5 +251,74 @@ func TestReloadTLSSwapsCertificate(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("swapped leaf lacks new SAN: %v", leaf.DNSNames)
+	}
+}
+
+// The dual-protocol listener serves plain HTTP and TLS on the SAME port:
+// the per-connection sniff routes a TLS ClientHello to the TLS server and
+// everything else to plain HTTP — no more "Client sent an HTTP request to
+// an HTTPS server".
+func TestDualProtocolSamePort(t *testing.T) {
+	up := &fakeUpstream{}
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := testConfig(upSrv.URL)
+	cfg.Server.TLS = tlsCfg(t)
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.NewRegistry())
+
+	mat, err := tlscert.Load(cfg.Server.TLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.tlsCert.Store(&mat.Certificate)
+	s.tlsCfg = s.makeTLSConfig()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = s.serveDual(ln) }()
+
+	caPEM, err := os.ReadFile(tlscert.CACertPath(cfg.Server.TLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(caPEM)
+	base := "http://" + ln.Addr().String()
+
+	// Plain HTTP request against the dual listener.
+	resp, err := http.Get(base + "/health")
+	if err != nil {
+		t.Fatalf("plain http on dual port: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.TLS != nil || !strings.Contains(string(body), "ok") {
+		t.Fatalf("plain http: status=%d tls=%v body=%s", resp.StatusCode, resp.TLS != nil, body)
+	}
+
+	// TLS request on the same port, verified against the generated CA.
+	tlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}}
+	resp, err = tlsClient.Get("https://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("https on dual port: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.TLS == nil {
+		t.Fatalf("https: status=%d", resp.StatusCode)
+	}
+
+	// And the full conversion path over plain HTTP still works.
+	resp, err = http.Post(base+"/v1/responses", "application/json", strings.NewReader(responsesBody(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"output"`) {
+		t.Fatalf("convert over plain http: status=%d body=%s", resp.StatusCode, body)
 	}
 }

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -48,6 +49,11 @@ type Server struct {
 	// tlsCert is the currently served certificate; swapped atomically on
 	// SIGHUP so GetCertificate always hands out a consistent one.
 	tlsCert atomic.Pointer[tls.Certificate]
+	tlsCfg  *tls.Config
+	// rawLn is the plain listener behind the dual-protocol accept loop;
+	// closed at shutdown to release it (http.Server only tracks listeners
+	// it accepted from itself).
+	rawLn net.Listener
 }
 
 // New constructs the server. Call Run to start it.
@@ -131,18 +137,8 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("server.tls: %w", err)
 		}
+		s.tlsCfg = s.makeTLSConfig()
 		s.tlsCert.Store(&mat.Certificate)
-		// The certificate is served through GetCertificate so a SIGHUP can
-		// swap it without a restart; ServeTLS still enables HTTP/2.
-		s.httpSrv.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				if c := s.tlsCert.Load(); c != nil {
-					return c, nil
-				}
-				return nil, errors.New("tls certificate not loaded")
-			},
-		}
 		source := matSource(s.cfg.Server.TLS, mat)
 		if mat.GeneratedCA {
 			s.logger.Info("generated self-signed CA — import it into clients' trust stores (once)",
@@ -154,16 +150,17 @@ func (s *Server) Run(ctx context.Context) error {
 				"python", "REQUESTS_CA_BUNDLE="+mat.CACertPath,
 			)
 		}
-		s.logger.Info("tls enabled", "source", source)
+		s.logger.Info("tls enabled — listener auto-detects http and https per connection", "source", source)
 	}
 
 	ln, err := net.Listen("tcp", s.cfg.Server.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.Server.Listen, err)
 	}
+	s.rawLn = ln
 	s.logger.Info("listening",
 		"addr", s.cfg.Server.Listen,
-		"tls", s.cfg.Server.TLS.Enabled,
+		"tls", s.dualProto(),
 		"upstream", s.cfg.Upstream.URL(),
 		"max_concurrency", s.cfg.Limits.MaxConcurrency,
 		"version", Version,
@@ -171,10 +168,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		// ServeTLS with empty file names serves TLSConfig.Certificates /
-		// GetCertificate and enables HTTP/2; plain Serve stays HTTP/1.1.
+		// With TLS enabled the accept loop sniffs each connection's wire
+		// protocol (plain Serve stays HTTP/1.1).
 		if s.cfg.Server.TLS.Enabled {
-			errCh <- s.httpSrv.ServeTLS(ln, "", "")
+			errCh <- s.serveDual(ln)
 			return
 		}
 		errCh <- s.httpSrv.Serve(ln)
@@ -212,6 +209,93 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+// makeTLSConfig builds the per-connection TLS config. Certificates are
+// served through GetCertificate so a SIGHUP can swap them without a
+// restart. HTTP/2 is not offered: the dual-protocol path serves each
+// connection via tls.Server, which bypasses ServeTLS's h2 setup —
+// HTTP/1.1 on both protocols, which every client negotiates fine.
+func (s *Server) makeTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if c := s.tlsCert.Load(); c != nil {
+				return c, nil
+			}
+			return nil, errors.New("tls certificate not loaded")
+		},
+	}
+}
+
+// dualProto names the listener protocols for logs.
+func (s *Server) dualProto() string {
+	if s.cfg.Server.TLS.Enabled {
+		return "http+https (auto per connection)"
+	}
+	return "false"
+}
+
+// serveDual accepts connections and serves each through the standard
+// HTTP server after sniffing its wire protocol — one port, both
+// protocols; plain-HTTP clients never see "Client sent an HTTP request
+// to an HTTPS server" again.
+func (s *Server) serveDual(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go s.serveOneConn(conn)
+	}
+}
+
+// serveOneConn peeks the first bytes: 0x16 0x03 is a TLS ClientHello
+// (handshake, legacy version major 3); anything else is HTTP.
+func (s *Server) serveOneConn(conn net.Conn) {
+	// Bound the peek so a silent half-open connection cannot park here
+	// forever; the HTTP server applies its own deadlines afterwards.
+	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.Timeouts.HeaderWrite))
+	br := bufio.NewReaderSize(conn, 4096)
+	head, err := br.Peek(2)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	c := net.Conn(&sniffedConn{Conn: conn, r: br})
+	if head[0] == 0x16 && head[1] == 0x03 {
+		c = tls.Server(c, s.tlsCfg)
+	}
+	_ = s.httpSrv.Serve(&oneShotListener{conn: c})
+}
+
+// sniffedConn replays the peeked bytes on the first Read.
+type sniffedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *sniffedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// oneShotListener yields exactly one connection, then reports closed —
+// enough for http.Server.Serve to run its full per-connection loop
+// (keep-alive, timeouts, ConnState metrics) on it.
+type oneShotListener struct {
+	conn net.Conn
+	done bool
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	if l.done {
+		return nil, net.ErrClosed
+	}
+	l.done = true
+	return l.conn, nil
+}
+func (l *oneShotListener) Close() error   { return nil }
+func (l *oneShotListener) Addr() net.Addr { return l.conn.RemoteAddr() }
+
 // reloadTLS re-reads the TLS material (which re-signs the leaf when SANs
 // or host addresses drifted) and swaps the served certificate atomically.
 // In-flight connections keep the certificate they negotiated.
@@ -245,6 +329,11 @@ func (s *Server) Shutdown() error {
 	if err := s.httpSrv.Shutdown(drainCtx); err != nil {
 		s.logger.Warn("graceful shutdown deadline exceeded, forcing close", "err", err.Error())
 		_ = s.httpSrv.Close()
+	}
+	// Release the dual-protocol accept loop: http.Server only closes
+	// listeners it accepted from itself, and this one is ours.
+	if s.rawLn != nil {
+		_ = s.rawLn.Close()
 	}
 	s.client.CloseIdleConnections()
 	s.logger.Info("shutdown complete",

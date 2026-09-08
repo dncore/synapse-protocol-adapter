@@ -35,7 +35,7 @@ It is a **transparent protocol adapter** — nothing more:
 - ✅ Forwards client `Authorization` and all other headers **verbatim** to upstream
 - ✅ True chunk-by-chunk SSE streaming with immediate flush
 - ✅ Client disconnect cancels the upstream request immediately
-- ✅ Optional HTTPS listener (`server.tls`) — auto-generated self-signed CA or bring-your-own cert, for agents that require `https://` base URLs
+- ✅ Optional TLS on the listener (`server.tls`) — HTTP and HTTPS served on one port (auto-detected per connection), self-signed CA auto-generated or bring-your-own, for agents that require `https://` base URLs
 - ✅ Single static binary · Docker · systemd · graceful drain on SIGTERM
 
 ## Architecture
@@ -64,8 +64,8 @@ It is a **transparent protocol adapter** — nothing more:
    flushed per event    │  │ (flush/evt)│    │ (split-    │    │   keep-alive pool) │   │
                         │  └────────────┘    │  safe)     │    └────────────────────┘   │
                         │                    └────────────┘                             │
-                        │  listener: plain HTTP - or TLS terminator (HTTP/2):            │
-                        │  auto self-signed CA or your cert (server.tls)                 │
+                        │  listener: plain HTTP - or dual HTTP+HTTPS per connection:     │
+                        │  (server.tls: auto self-signed CA / your cert)                 │
                         │  middleware: request-id -> access-log -> recover               │
                         │  ops: /health /ready /metrics   lifecycle: graceful shutdown   │
                         └───────────────────────────────────────────────────────────────┘
@@ -344,7 +344,7 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `server.listen` | `0.0.0.0:8787` | `PROXY_SERVER_LISTEN` | Listen address; `0.0.0.0` exposes to the LAN |
-| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | Serve the listener over HTTPS — for agents whose base_url must be `https://` (see [HTTPS listener](#https-listener-tls)). Independent of the upstream scheme |
+| `server.tls.enabled` | `false` | `PROXY_SERVER_TLS_ENABLED` | Serve HTTP **and** HTTPS on the listener (auto-detected per connection) — for agents whose base_url must be `https://` (see [HTTPS listener](#https-listener-tls)). Independent of the upstream scheme |
 | `server.tls.cert_file` / `key_file` | — | `PROXY_SERVER_TLS_CERT_FILE` / `_KEY_FILE` | Bring-your-own PEM certificate (Let's Encrypt, internal CA, mkcert); both together. Unset = auto-generated self-signed CA |
 | `server.tls.auto_dir` | `~/.config/synapse/tls` | `PROXY_SERVER_TLS_AUTO_DIR` | Where the generated CA + certificate persist |
 | `server.tls.sans` | — | `PROXY_SERVER_TLS_SANS` (comma-separated) | Extra DNS names / IPs in the generated certificate (defaults cover localhost, hostname, every interface IP) |
@@ -524,9 +524,11 @@ sudo iptables -A INPUT -p tcp --dport 8787 -j ACCEPT                            
 ## HTTPS listener (TLS)
 
 Some agents refuse `http://` provider base URLs outright. Flip one switch
-and the listener speaks HTTPS — the proxy then still talks plain HTTP (or
-HTTPS) to the upstream exactly as before; the two directions are
-independent:
+and the listener serves **HTTP and HTTPS on the same port** — the wire
+protocol is detected per connection, so plain-HTTP clients (curl, probes,
+existing configs) keep working while https-demanding agents get TLS. The
+proxy then still talks plain HTTP (or HTTPS) to the upstream exactly as
+before; the two directions are independent:
 
 ```yaml
 server:
@@ -545,20 +547,20 @@ machine hostname, every interface IP, plus any `sans:` entries.
 
 ### Downloading the CA & the import tutorial
 
-The daemon serves its CA and a walkthrough page (TLS mode only):
+The daemon serves its CA and a walkthrough page (TLS mode only). Since
+the port speaks plain HTTP too, the one request you cannot yet verify —
+fetching the CA — simply goes over HTTP:
 
 ```bash
-curl -k https://<host>:<port>/ca.pem -o synapse-ca.pem
+curl http://<host>:<port>/ca.pem -o synapse-ca.pem
 ```
 
-`-k` skips verification for that one bootstrap request — you do not
-trust the CA yet, so you fetch it, then trust it; every later request
-verifies for real. Then point whoever needs it at
-`https://<host>:<port>/tls-help`: it renders the import steps for macOS,
-Debian/Ubuntu, Fedora/Arch, and Windows (plus the
-`NODE_EXTRA_CA_CERTS`/`REQUESTS_CA_BUNDLE` no-system-change variants)
-with this daemon's exact address baked in, so nobody has to write or
-guess the commands. Reference for the impatient:
+After importing it below, `https://` URLs verify for real. Point whoever
+needs it at `http(s)://<host>:<port>/tls-help`: the page renders the
+import steps for macOS, Debian/Ubuntu, Fedora/Arch, and Windows (plus
+the `NODE_EXTRA_CA_CERTS`/`REQUESTS_CA_BUNDLE` no-system-change
+variants) with this daemon's exact address baked in, so nobody has to
+write or guess the commands. Reference for the impatient:
 
 ```bash
 # Debian/Ubuntu
@@ -614,8 +616,9 @@ server:
 
 Notes:
 
-- HTTP/2 is negotiated automatically over TLS; streaming behavior is
-  identical.
+- Both protocols run HTTP/1.1: protocol detection happens before the
+  TLS handshake, so h2 is not offered on this port (every client
+  negotiates 1.1 fine); streaming behavior is identical.
 - `synapse status` and `synapse healthcheck` follow the config and probe
   over `https` (self-probe: certificate not verified). Docker's
   `HEALTHCHECK` keeps working — mount the config or set
