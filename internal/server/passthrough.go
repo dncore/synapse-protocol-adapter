@@ -33,6 +33,12 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ActiveRequests.Inc()
 	defer s.metrics.ActiveRequests.Dec()
 
+	releaseUser := s.enterUser(w, r)
+	if releaseUser == nil {
+		return
+	}
+	defer releaseUser()
+
 	release := s.acquireSlot(r)
 	if release == nil {
 		return // client went away while queued

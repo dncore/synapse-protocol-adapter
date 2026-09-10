@@ -26,6 +26,8 @@ type Registry struct {
 	BytesInTotal             *Counter
 	BytesOutTotal            *Counter
 	UpstreamConnections      *Counter
+	QueuedRequestsTotal      *Counter
+	QueueRejectedTotal       *LabeledCounter
 
 	// Gauges.
 	ActiveConnections *Gauge
@@ -35,6 +37,7 @@ type Registry struct {
 	RequestDuration  *Histogram
 	UpstreamDuration *Histogram
 	FirstByteLatency *Histogram
+	QueueWait        *Histogram
 }
 
 var defaultBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300}
@@ -52,6 +55,8 @@ func NewRegistry() *Registry {
 		BytesInTotal:             &Counter{Name: "protocol_proxy_bytes_in_total", Help: "Bytes received from clients (request bodies)."},
 		BytesOutTotal:            &Counter{Name: "protocol_proxy_bytes_out_total", Help: "Bytes sent to clients (response bodies)."},
 		UpstreamConnections:      &Counter{Name: "protocol_proxy_upstream_requests_total", Help: "Total requests issued to upstream."},
+		QueuedRequestsTotal:      &Counter{Name: "protocol_proxy_queued_requests_total", Help: "Requests that waited in a per-user concurrency queue before being admitted."},
+		QueueRejectedTotal:       &LabeledCounter{Name: "protocol_proxy_queue_rejected_total", Help: "Requests rejected by per-user queueing, by reason.", Label: "reason"},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -59,6 +64,7 @@ func NewRegistry() *Registry {
 		RequestDuration:  NewHistogram("protocol_proxy_request_duration_seconds", "End-to-end request duration.", defaultBuckets),
 		UpstreamDuration: NewHistogram("protocol_proxy_upstream_duration_seconds", "Upstream request duration (until response headers).", defaultBuckets),
 		FirstByteLatency: NewHistogram("protocol_proxy_first_byte_latency_seconds", "Latency from request start to first SSE event flushed to client.", defaultBuckets),
+		QueueWait:        NewHistogram("protocol_proxy_queue_wait_seconds", "Time requests spent waiting in a per-user concurrency queue.", defaultBuckets),
 	}
 }
 
@@ -174,6 +180,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeCounter(r.BytesInTotal, "")
 	writeCounter(r.BytesOutTotal, "")
 	writeCounter(r.UpstreamConnections, "")
+	writeCounter(r.QueuedRequestsTotal, "")
 
 	writeLabeled := func(lc *LabeledCounter) {
 		fmt.Fprintf(sb, "# HELP %s %s\n# TYPE %s counter\n", lc.Name, lc.Help, lc.Name)
@@ -194,6 +201,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	}
 	writeLabeled(r.ErrorsTotal)
 	writeLabeled(r.UpstreamErrorsTotal)
+	writeLabeled(r.QueueRejectedTotal)
 
 	writeGauge := func(g *Gauge) {
 		fmt.Fprintf(sb, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", g.Name, g.Help, g.Name, g.Name, g.v.Load())
@@ -216,6 +224,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeHistogram(r.RequestDuration)
 	writeHistogram(r.UpstreamDuration)
 	writeHistogram(r.FirstByteLatency)
+	writeHistogram(r.QueueWait)
 }
 
 func formatFloat(f float64) string {

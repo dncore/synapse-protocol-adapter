@@ -26,13 +26,14 @@ Custom LLM Provider                 (Chat Completions API)
 
 它是一个**透明的协议适配器**，仅此而已：
 
-- ❌ 不管理 API Key——从不生成、存储或改写凭据
+- ❌ 不处理凭据——从不生成、存储或改写 API Key；`Authorization` 永远原样转发（下方的可选按用户排队功能注册 Key 时也**只存哈希**）
 - ❌ 无账号体系、无 OAuth、无计费、无 Key 池
 - ❌ 不保存会话/对话——重启后完全无状态
 - ✅ 客户端的 `Authorization` 及其他 header **原样透传**到 upstream
 - ✅ 真正逐 chunk 的 SSE 流式转换，逐事件 flush
 - ✅ 客户端断开立即取消 upstream 请求
 - ✅ 监听可选 TLS（`server.tls`）——HTTP 与 HTTPS 同端口共存（按连接自动识别），自动生成自签名 CA 或自带证书，供强制 `https://` base_url 的 agent 使用
+- ✅ 可选按 API Key 并发排队（`users`）——每个 Key 一条 FIFO 队列 + 可运行时调整的并发上限，单个用户永远不会触发 upstream 的按 Key 429
 - ✅ 单静态二进制 · Docker · systemd · SIGTERM 优雅退出
 
 ## 架构
@@ -62,7 +63,8 @@ Custom LLM Provider                 (Chat Completions API)
                         │  listener: 明文 HTTP 或 HTTP+HTTPS 双协议自动探测:             │
                         │  (server.tls: 自动自签 CA / 自带证书)                          │
                         │  middleware: request-id -> access-log -> recover               │
-                        │  运维面: /health /ready /metrics   生命周期: graceful shutdown  │
+                        │  users: 按 Key FIFO 队列 -> 并发上限（可选）                   │
+                        │  运维面: /health /ready /metrics /users  生命周期: graceful     │
                         └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -167,6 +169,10 @@ chmod +x synapse-linux-x64 && ./synapse-linux-x64 --version
 - **资源占用**：空闲 RSS 11 MB → 持续负载下 26–46 MB，稳定无增长；
   单静态二进制，零运行时依赖
 
+可选的按用户排队（开启时）每请求只增加亚微秒级开销——实测数字见
+[按 API Key 并发排队 → 排队的性能开销](#排队的性能开销实测)；
+不改变吞吐上限。
+
 转换层微基准（`make bench`）——纳秒花在哪：
 
 ```
@@ -202,6 +208,8 @@ provider 复测同样指标。
 | `GET /ready` | 就绪——shutdown 开始即 503 |
 | `GET /metrics` | Prometheus 文本格式 |
 | `GET /version` | 构建版本 |
+| `GET /users` | 按用户排队：每个已注册 Key 的实时槽位、队列与限额（见[按 API Key 并发排队](#按-api-key-并发排队)） |
+| `PUT /users/{id}` | 在线修改单个用户的并发上限（不持久化） |
 | `GET /ca.pem` | 生成的 CA 证书（仅 `server.tls` 自动证书模式）——客户端信任引导 |
 | `GET /tls-help` | 各平台 CA 导入教程页，内嵌本服务地址（仅 `server.tls` 开启时） |
 | `GET /` | 端点列表 |
@@ -334,6 +342,11 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | 最大在途请求数；超出排队（背压）。`0` = 不限制 |
 | `limits.max_body_bytes` | `67108864` | `PROXY_LIMITS_MAX_BODY_BYTES` | 客户端请求体上限（字节） |
 | `limits.max_sse_line_bytes` | `16777216` | — | 单条 SSE data 行上限（大 tool 参数） |
+| `users.enabled` | `false` | `PROXY_USERS_ENABLED` | 开启按 API Key 排队（见[按 API Key 并发排队](#按-api-key-并发排队)）；关闭 = 完全不限制 |
+| `users.default_concurrency` | `90` | `PROXY_USERS_DEFAULT_CONCURRENCY` | 单用户 upstream 并发上限（流式请求占槽到最后一字节） |
+| `users.max_queue` | `128` | `PROXY_USERS_MAX_QUEUE` | 单用户排队深度；超出立即 429 + `Retry-After`。`0` = 不限 |
+| `users.queue_timeout` | `120s` | `PROXY_USERS_QUEUE_TIMEOUT` | 排队等待上限；超出 429 |
+| `users.keys` | `[]` | — | 可选的每用户命名与并发覆盖；列不列出都按 `default_concurrency` 排队 |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | 单请求总时长上限（长生成） |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | keep-alive 空闲连接超时 |
@@ -350,6 +363,96 @@ synapse check-config --config config.yaml
 ```
 
 配置非法时以非零码退出，并精确指出字段与期望值。
+
+## 按 API Key 并发排队
+
+**可选功能**（`users.enabled: true`，默认关闭——关闭即现有行为，完全
+不限制）。开启后，每个客户端 API Key 标识一个用户，每个用户对
+**upstream** 的并发请求数被限制在可配置的上限内（默认 90，恰好低于
+"约 100 并发就开始 429" 的网关阈值）。超出的请求进入该用户的 FIFO
+队列；一旦有槽位释放——包括流式响应的最后一字节落盘——队头请求立即
+顶上，upstream 看到的是恒定在上限处的并发，而不是冲进 429。
+
+```yaml
+users:
+  enabled: true
+  default_concurrency: 90     # 单 Key 上限；流式请求占槽到最后一字节
+  max_queue: 128              # 单用户排队深度；超出 → 429 + Retry-After
+  queue_timeout: 120s         # 最长排队等待；超出 → 429
+  keys:                       # 可选：命名 + 每用户覆盖
+    - name: dean
+      key: "Bearer sk-live-..."   # 加载即哈希——明文从不驻留内存
+      concurrency: 90             # 0/省略 = default_concurrency
+    - name: ci
+      key_hash: "sha256:9f3a…64位十六进制"   # 也可以一开始就只注册哈希
+```
+
+值得了解的语义：
+
+- **身份** = 凭据的 sha256（优先取 `Authorization`，其次
+  `x-api-key`/`api-key`——Anthropic 风格客户端）。配置里的明文 `key:`
+  在加载时立刻哈希并擦除——`synapse check-config` 输出、日志、`/users`
+  里只会出现哈希前缀。自行计算 `key_hash`：
+  `printf %s "Bearer sk-…" | sha256sum`。
+- **所有 Key 一视同仁**——`users.keys` 列表与限不限流无关，只为命名或
+  覆盖并发数。未列出的 Key（以及完全不带凭据的请求——它们共用一个匿名
+  桶）自动按 `default_concurrency` 注册排队。
+- **槽位覆盖整个请求生命周期**，含流式——"并发 90" 指 90 个在生成中的
+  请求，不是 90 条连接。
+- **与全局上限的关系**：用户闸门在 `limits.max_concurrency` **之前**，
+  排队中的请求不占全局槽位——一个用户的积压不会饿死其他用户。全局上限
+  退化为进程保险丝（建议 ≥ 各用户上限之和，或设 `0`）；真正的准入控制
+  由每用户上限承担。
+- **429 带 `Retry-After: 1`** 和 `rate_limit_error` 错误体，队列溢出
+  （`max_queue`）与排队超时（`queue_timeout`）同此。
+- **运行时修改不持久化**：`PUT`/`synapse users set` 立即生效（调高立即
+  放行排队请求；调低不抢占、在途请求自然排干），重启后回到配置文件的值。
+- **单实例**：队列状态在内存中。多副本 + 负载均衡时每副本独立计数
+  （有效上限 × 副本数），除非按 Key 做会话粘滞。自动注册的用户状态伴随
+  进程生命周期（每个约 0.5 KB）。
+
+实时状态与控制：
+
+```bash
+synapse users list
+# enabled: default concurrency 90, max queue 128, queue timeout 2m0s
+# queue depth: 0
+#
+# ID                NAME  LIMIT  ACTIVE  QUEUED  REQUESTS  WAITED  REJECTED  LAST SEEN
+# 324be32f05afb4f5  dean      90       3       1       456       8         0  2026-09-10 13:47
+
+synapse users set --concurrency 6 dean     # 在线生效，无需重启
+```
+
+HTTP 等价面：`GET /users` 返回同样的 JSON，`PUT /users/dean` 携带
+`{"concurrency": 6}` 修改上限。Prometheus 拿到的是聚合视图
+（`protocol_proxy_queued_requests_total`、
+`protocol_proxy_queue_wait_seconds`、
+`protocol_proxy_queue_rejected_total{reason}`、
+`protocol_proxy_queue_depth`）；每用户明细在 `GET /users`
+（不进 `/metrics`，以约束 label 基数）。
+
+### 排队的性能开销（实测）
+
+对 LLM 往返而言，这道闸门的开销可以忽略：
+
+| 操作 | 开销 |
+|---|---|
+| 身份识别（凭据 sha256 + 注册表查找） | ~77 ns |
+| 槽位获取/释放（单用户互斥竞争下） | ~505 ns |
+| 排队请求 park + 释放时唤醒 | 个位数 µs |
+| 每个注册用户的内存 | ~0.5 KB |
+| 每个排队请求的内存（驻留 goroutine + 连接缓冲） | ~10–30 KB |
+
+相对代理 ~3.5 万 req/s 的吞吐上限，占比 ≤ ~0.02%；相对真实 LLM 延迟
+（秒到分钟级）不可测量。排队真正的代价是**等待时间本身**：并发上限
+90、流长 2 分钟时，突发请求的尾部要按流时长的整数倍排队。两个推论：
+
+- `queue_timeout`（默认 120s）存在的原因：排队中的请求在获准之前**收不
+  到任何字节**——连 SSE keep-alive 都发不出去；必须赶在客户端自行超时
+  重试之前拒绝它们（否则重试会继续堆积进队列）。
+- `max_queue`（默认 128）限制内存：每个排队请求驻留一个 goroutine 并
+  占住一条连接。满队列时 128 × ~20 KB ≈ 每用户 2.5 MB。
 
 ## Docker
 
@@ -684,6 +787,14 @@ curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
 | `protocol_proxy_request_duration_seconds` | histogram | 端到端延迟 |
 | `protocol_proxy_upstream_duration_seconds` | histogram | 到 upstream 响应头的时间 |
 | `protocol_proxy_first_byte_latency_seconds` | histogram | 请求开始 → 首个 SSE 事件 flush |
+| `protocol_proxy_queued_requests_total` | counter | 在用户队列中等待过的请求 |
+| `protocol_proxy_queue_wait_seconds` | histogram | 用户队列中的等待时长 |
+| `protocol_proxy_queue_rejected_total{reason}` | counter | 队列溢出 / 超时导致的 429 |
+| `protocol_proxy_queue_depth` | gauge | 当前正在用户队列中等待的请求数 |
+
+（每用户明细——各 Key 的槽位、队列、限额——在 `GET /users`，不进
+`/metrics`，以约束 label 基数。排队功能关闭时这些计数器恒为 0；
+`protocol_proxy_queue_depth` 仅在 `users.enabled` 开启时输出。）
 
 日志为结构化 JSON（slog）：`timestamp`、`level`、`request_id`、
 `method`、`path`、`status`、`bytes_out`、`latency_ms`。代理**从不**记录
@@ -731,6 +842,12 @@ Internet  ✗  （绝不直连）
 如果必须暴露到可信网络之外，请在前面加认证层（mTLS、OAuth2-proxy、
 Cloudflare Access、Tailscale Funnel……）或自行添加认证 middleware——
 middleware 层是独立隔离的，加一个文件即可。
+
+按用户排队的运维面沿用同一信任模型：`GET /users` 与 `PUT /users/{id}`
+和 `/metrics` 一样不做认证（能访问端口的人就能读实时状态或改限额）。
+配置里以 `key:` 注册的 Key 加载即哈希——明文 Key 永远不会出现在运行
+时配置、日志或任何端点里——凭据唯一存在的地方是配置文件本身，请保持
+`0600` 权限。
 
 ## 许可证
 

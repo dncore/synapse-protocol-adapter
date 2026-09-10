@@ -5,7 +5,9 @@
 package config
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -29,6 +31,7 @@ type Config struct {
 	Server   Server   `yaml:"server"`
 	Upstream Upstream `yaml:"upstream"`
 	Limits   Limits   `yaml:"limits"`
+	Users    Users    `yaml:"users"`
 	Timeouts Timeouts `yaml:"timeouts"`
 	Shutdown Shutdown `yaml:"shutdown"`
 	Log      Log      `yaml:"log"`
@@ -97,13 +100,54 @@ type Limits struct {
 	MaxSSELine     int `yaml:"max_sse_line_bytes"`
 }
 
+// Users configures per-API-key concurrency queueing: every client key
+// identifies a user whose concurrent upstream requests are capped; excess
+// requests queue FIFO instead of hitting the upstream's own limits. The
+// section is opt-in — absent or disabled means today's behavior (no
+// per-user limiting at all).
+type Users struct {
+	// Enabled turns per-user queueing on. Default false: no limiting.
+	Enabled bool `yaml:"enabled"`
+	// DefaultConcurrency caps every user's concurrent upstream requests
+	// (streaming requests hold their slot until the last byte). Default
+	// 90: stay just under gateways that 429 around 100 concurrent.
+	DefaultConcurrency int `yaml:"default_concurrency"`
+	// MaxQueue bounds how many requests may wait per user; beyond it the
+	// proxy answers 429 immediately (with Retry-After). 0 = unlimited.
+	MaxQueue int `yaml:"max_queue"`
+	// QueueTimeout fails requests that waited longer than this with 429 —
+	// queued requests cannot receive any bytes (not even keep-alives), so
+	// the wait must end before clients give up and retry. 0 = unlimited.
+	QueueTimeout time.Duration `yaml:"queue_timeout"`
+	// Keys optionally names users and overrides their concurrency; every
+	// key queues at default_concurrency whether listed or not. Entries
+	// may carry the raw key (key:) or its hash (key_hash:); raw keys are
+	// hashed at load time and never kept in memory or printed by
+	// `synapse check-config`.
+	Keys []UserKey `yaml:"keys"`
+}
+
+// UserKey is one registered user. Exactly one of Key/KeyHash must be set.
+type UserKey struct {
+	Name string `yaml:"name"`
+	// Key is the raw credential as sent by the client (Authorization
+	// value, or x-api-key/api-key value). Replaced by KeyHash at load.
+	Key string `yaml:"key"`
+	// KeyHash is "sha256:<64 hex>" — what Key becomes at load, so
+	// credentials never persist in the running config.
+	KeyHash string `yaml:"key_hash"`
+	// Concurrency overrides users.default_concurrency for this user.
+	// 0 = use the default.
+	Concurrency int `yaml:"concurrency"`
+}
+
 // Timeouts tunes the HTTP server and upstream transport.
 type Timeouts struct {
-	Connect        time.Duration `yaml:"connect"`
-	Request        time.Duration `yaml:"request"`
-	Idle           time.Duration `yaml:"idle"`
-	StreamWrite    time.Duration `yaml:"stream_write"`
-	HeaderWrite    time.Duration `yaml:"header_write"`
+	Connect     time.Duration `yaml:"connect"`
+	Request     time.Duration `yaml:"request"`
+	Idle        time.Duration `yaml:"idle"`
+	StreamWrite time.Duration `yaml:"stream_write"`
+	HeaderWrite time.Duration `yaml:"header_write"`
 }
 
 // Shutdown tunes graceful shutdown.
@@ -126,6 +170,12 @@ func Defaults() Config {
 			MaxConcurrency: 200,
 			MaxBodyBytes:   64 << 20, // 64 MiB: conversation histories can be large
 			MaxSSELine:     16 << 20, // 16 MiB max SSE data line
+		},
+		Users: Users{
+			Enabled:            false,
+			DefaultConcurrency: 90,
+			MaxQueue:           128,
+			QueueTimeout:       120 * time.Second,
 		},
 		Timeouts: Timeouts{
 			Connect:     10 * time.Second,
@@ -154,10 +204,38 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyEnv(&cfg)
+	normalizeUsers(&cfg)
 	if err := Validate(&cfg); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// HashCredential derives the user identity of a credential value
+// ("Bearer sk-...", an x-api-key value, ...): sha256 over the exact bytes
+// the client sent, rendered as "sha256:<64 hex>". The proxy never stores
+// or logs credentials — only this hash.
+func HashCredential(cred string) string {
+	sum := sha256.Sum256([]byte(cred))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// normalizeUsers folds raw keys into hashes so no credential survives in
+// the running config.
+func normalizeUsers(cfg *Config) {
+	for i := range cfg.Users.Keys {
+		k := &cfg.Users.Keys[i]
+		if k.Key != "" {
+			k.KeyHash = HashCredential(k.Key)
+			k.Key = ""
+		} else {
+			// Accept a bare hex digest too; canonical form carries the prefix.
+			h := strings.TrimPrefix(k.KeyHash, "sha256:")
+			if len(h) == 64 {
+				k.KeyHash = "sha256:" + strings.ToLower(h)
+			}
+		}
+	}
 }
 
 // applyEnv overrides config values from PROXY_<SECTION>_<KEY> environment
@@ -206,6 +284,26 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PROXY_LIMITS_MAX_BODY_BYTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Limits.MaxBodyBytes = n
+		}
+	}
+	if v := os.Getenv("PROXY_USERS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Users.Enabled = b
+		}
+	}
+	if v := os.Getenv("PROXY_USERS_DEFAULT_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Users.DefaultConcurrency = n
+		}
+	}
+	if v := os.Getenv("PROXY_USERS_MAX_QUEUE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Users.MaxQueue = n
+		}
+	}
+	if v := os.Getenv("PROXY_USERS_QUEUE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Users.QueueTimeout = d
 		}
 	}
 	if v := os.Getenv("PROXY_TIMEOUTS_CONNECT"); v != "" {
@@ -283,6 +381,9 @@ func Validate(cfg *Config) error {
 	if cfg.Limits.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("limits.max_body_bytes must be > 0"))
 	}
+	if err := validateUsers(cfg); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.Timeouts.Connect <= 0 {
 		errs = append(errs, errors.New("timeouts.connect must be > 0 (e.g. 10s)"))
 	}
@@ -309,6 +410,57 @@ func Validate(cfg *Config) error {
 		errs = append(errs, fmt.Errorf("log.level must be debug|info|warn|error, got %q", cfg.Log.Level))
 	}
 
+	return errors.Join(errs...)
+}
+
+// validateUsers checks the per-user queueing section. Validated whether or
+// not the feature is enabled, so `synapse check-config` catches bad values
+// before they are switched on.
+func validateUsers(cfg *Config) error {
+	var errs []error
+	u := cfg.Users
+	if u.DefaultConcurrency < 1 {
+		errs = append(errs, fmt.Errorf("users.default_concurrency must be >= 1, got %d", u.DefaultConcurrency))
+	}
+	if u.MaxQueue < 0 {
+		errs = append(errs, fmt.Errorf("users.max_queue must be >= 0 (0 = unlimited), got %d", u.MaxQueue))
+	}
+	if u.QueueTimeout <= 0 {
+		errs = append(errs, errors.New("users.queue_timeout must be > 0 (e.g. 120s)"))
+	}
+	names := map[string]bool{}
+	seen := map[string]bool{}
+	for i, k := range u.Keys {
+		if k.Key != "" && k.KeyHash != "" {
+			errs = append(errs, fmt.Errorf("users.keys[%d]: set either key or key_hash, not both", i))
+			continue
+		}
+		if k.Key == "" && k.KeyHash == "" {
+			errs = append(errs, fmt.Errorf("users.keys[%d]: key or key_hash must be set", i))
+			continue
+		}
+		hash := k.KeyHash
+		if hash == "" { // raw key set directly on the struct, not via Load
+			hash = HashCredential(k.Key)
+		}
+		if !strings.HasPrefix(hash, "sha256:") || len(hash) != len("sha256:")+64 {
+			errs = append(errs, fmt.Errorf("users.keys[%d].key_hash must be sha256:<64 hex>, got %q", i, k.KeyHash))
+			continue
+		}
+		if seen[hash] {
+			errs = append(errs, fmt.Errorf("users.keys[%d]: duplicate key", i))
+		}
+		seen[hash] = true
+		if k.Name != "" {
+			if names[k.Name] {
+				errs = append(errs, fmt.Errorf("users.keys[%d]: duplicate name %q", i, k.Name))
+			}
+			names[k.Name] = true
+		}
+		if k.Concurrency < 0 {
+			errs = append(errs, fmt.Errorf("users.keys[%d].concurrency must be >= 0 (0 = default)", i))
+		}
+	}
 	return errors.Join(errs...)
 }
 

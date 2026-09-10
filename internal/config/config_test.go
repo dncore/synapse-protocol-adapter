@@ -159,6 +159,116 @@ func TestLoad_MalformedYAML(t *testing.T) {
 	}
 }
 
+func TestLoad_UsersDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Users.Enabled {
+		t.Fatal("per-user queueing must default to disabled")
+	}
+	if cfg.Users.DefaultConcurrency != 90 || cfg.Users.MaxQueue != 128 || cfg.Users.QueueTimeout != 120*time.Second {
+		t.Fatalf("users defaults wrong: %+v", cfg.Users)
+	}
+}
+
+// Raw keys must be hashed at load: neither the running Config nor
+// Describe/check-config output may contain plaintext credentials.
+func TestLoad_UsersRawKeyHashedAndWiped(t *testing.T) {
+	path := writeTemp(t, `
+users:
+  enabled: true
+  keys:
+    - name: dean
+      key: "Bearer sk-secret-123"
+      concurrency: 12
+    - name: ci
+      key_hash: "9f3a6b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Users.Keys[0].Key != "" {
+		t.Fatalf("raw key survived load: %q", cfg.Users.Keys[0].Key)
+	}
+	want := HashCredential("Bearer sk-secret-123")
+	if cfg.Users.Keys[0].KeyHash != want {
+		t.Fatalf("key not hashed: %q want %q", cfg.Users.Keys[0].KeyHash, want)
+	}
+	// Bare 64-hex digests normalize to the sha256:-prefixed form.
+	if cfg.Users.Keys[1].KeyHash != "sha256:9f3a6b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8" {
+		t.Fatalf("bare hash not normalized: %q", cfg.Users.Keys[1].KeyHash)
+	}
+	if out := Describe(&cfg); strings.Contains(out, "sk-secret-123") {
+		t.Fatalf("Describe leaks raw key:\n%s", out)
+	}
+}
+
+func TestLoad_UsersEnvOverrides(t *testing.T) {
+	t.Setenv("PROXY_USERS_ENABLED", "true")
+	t.Setenv("PROXY_USERS_DEFAULT_CONCURRENCY", "8")
+	t.Setenv("PROXY_USERS_MAX_QUEUE", "7")
+	t.Setenv("PROXY_USERS_QUEUE_TIMEOUT", "9s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Users.Enabled || cfg.Users.DefaultConcurrency != 8 ||
+		cfg.Users.MaxQueue != 7 || cfg.Users.QueueTimeout != 9*time.Second {
+		t.Fatalf("users env overrides failed: %+v", cfg.Users)
+	}
+}
+
+func TestValidate_UsersErrors(t *testing.T) {
+	hash64 := "9f3a6b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"zero default concurrency", func(c *Config) { c.Users.DefaultConcurrency = 0 }, "default_concurrency"},
+		{"negative queue", func(c *Config) { c.Users.MaxQueue = -1 }, "max_queue"},
+		{"zero queue timeout", func(c *Config) { c.Users.QueueTimeout = 0 }, "queue_timeout"},
+		{"key entry empty", func(c *Config) {
+			c.Users.Keys = []UserKey{{Name: "x"}}
+		}, "must be set"},
+		{"key and hash both", func(c *Config) {
+			c.Users.Keys = []UserKey{{Key: "k", KeyHash: "sha256:" + hash64}}
+		}, "not both"},
+		{"bad hash", func(c *Config) {
+			c.Users.Keys = []UserKey{{KeyHash: "sha256:short"}}
+		}, "64 hex"},
+		{"duplicate key", func(c *Config) {
+			c.Users.Keys = []UserKey{{Key: "same"}, {Key: "same"}}
+		}, "duplicate key"},
+		{"duplicate name", func(c *Config) {
+			c.Users.Keys = []UserKey{{Name: "a", KeyHash: "sha256:" + hash64}, {Name: "a", Key: "other"}}
+		}, "duplicate name"},
+		{"negative concurrency", func(c *Config) {
+			c.Users.Keys = []UserKey{{Key: "k", Concurrency: -1}}
+		}, "concurrency"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			tc.mut(&cfg)
+			err := Validate(&cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
+			}
+		})
+	}
+
+	// A well-formed section validates (raw key on the struct is fine too).
+	cfg := Defaults()
+	cfg.Users.Enabled = true
+	cfg.Users.Keys = []UserKey{{Name: "dean", Key: "Bearer sk-x", Concurrency: 12}, {KeyHash: "sha256:" + hash64}}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("valid users config rejected: %v", err)
+	}
+}
+
 func TestLoad_TLSYAMLAndEnv(t *testing.T) {
 	path := writeTemp(t, `
 server:

@@ -569,3 +569,360 @@ func TestShutdown_ReadyFlipsTo503(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// --- per-user concurrency queueing ---
+
+// gatingUpstream holds every request until the test releases it, so
+// concurrency limits are observable.
+type gatingUpstream struct {
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	release  chan struct{}
+}
+
+func newGatingUpstream() *gatingUpstream {
+	return &gatingUpstream{release: make(chan struct{})}
+}
+
+func (g *gatingUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	g.inFlight++
+	if g.inFlight > g.peak {
+		g.peak = g.inFlight
+	}
+	g.mu.Unlock()
+
+	<-g.release
+
+	g.mu.Lock()
+	g.inFlight--
+	g.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1700000000,"model":"test",`+
+		`"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],`+
+		`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+}
+
+func (g *gatingUpstream) snapshot() (inFlight, peak int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inFlight, g.peak
+}
+
+// pulse lets one held upstream request complete.
+func (g *gatingUpstream) pulse() { g.release <- struct{}{} }
+
+func (g *gatingUpstream) waitForInFlight(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		if in, _ := g.snapshot(); in == n {
+			return
+		}
+		select {
+		case <-deadline:
+			in, peak := g.snapshot()
+			t.Fatalf("upstream in-flight never reached %d (now %d, peak %d)", n, in, peak)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+func usersTestConfig(upstreamURL string, ucfg config.Users) config.Config {
+	cfg := testConfig(upstreamURL)
+	cfg.Users = ucfg
+	return cfg
+}
+
+func postResponses(t *testing.T, url, auth string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url+"/v1/responses", strings.NewReader(responsesBody(false)))
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func usersCfg(defaultConcurrency, maxQueue int) config.Users {
+	return config.Users{
+		Enabled:            true,
+		DefaultConcurrency: defaultConcurrency,
+		MaxQueue:           maxQueue,
+		QueueTimeout:       30 * time.Second,
+		Keys: []config.UserKey{{
+			Name:    "dean",
+			KeyHash: config.HashCredential("Bearer dean-key"),
+		}},
+	}
+}
+
+// The third request with the same key queues behind the limit; releasing
+// one upstream slot admits it, and the upstream never sees more than the
+// cap concurrently.
+func TestUsersQueue_ThirdRequestWaitsForSlot(t *testing.T) {
+	up := newGatingUpstream()
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := usersTestConfig(upSrv.URL, usersCfg(2, 8))
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.NewRegistry())
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	results := make(chan int, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			resp := postResponses(t, proxySrv.URL, "Bearer dean-key")
+			results <- resp.StatusCode
+			resp.Body.Close()
+		}()
+	}
+
+	up.waitForInFlight(t, 2) // two at the upstream, third queued
+	time.Sleep(50 * time.Millisecond)
+	if in, _ := up.snapshot(); in != 2 {
+		t.Fatalf("limit violated: %d in flight", in)
+	}
+
+	// One finishes; the queued request takes its slot: the first result
+	// arrives and the upstream is back at the cap of 2 (never above it).
+	up.pulse()
+	if code := <-results; code != 200 {
+		t.Fatalf("first request failed: %d", code)
+	}
+	up.waitForInFlight(t, 2)
+	up.pulse()
+	up.pulse()
+	for i := 0; i < 2; i++ {
+		if code := <-results; code != 200 {
+			t.Fatalf("queued request failed: %d", code)
+		}
+	}
+	if _, peak := up.snapshot(); peak != 2 {
+		t.Fatalf("upstream peak %d — the cap was exceeded or never reached", peak)
+	}
+
+	// Slots fully released: a fresh request goes straight through.
+	done := make(chan int, 1)
+	go func() {
+		resp := postResponses(t, proxySrv.URL, "Bearer dean-key")
+		done <- resp.StatusCode
+		resp.Body.Close()
+	}()
+	up.waitForInFlight(t, 1)
+	up.pulse()
+	if code := <-done; code != 200 {
+		t.Fatalf("post-drain request: %d", code)
+	}
+}
+
+// Beyond max_queue the proxy itself answers 429 (+Retry-After) instead
+// of queueing forever.
+func TestUsersQueue_RejectsWith429BeyondMaxQueue(t *testing.T) {
+	up := newGatingUpstream()
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := usersTestConfig(upSrv.URL, usersCfg(1, 1))
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.NewRegistry())
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	results := make(chan *http.Response, 3)
+	for i := 0; i < 3; i++ {
+		go func() { results <- postResponses(t, proxySrv.URL, "Bearer dean-key") }()
+	}
+	up.waitForInFlight(t, 1)
+
+	// The only response available now is the queue-overflow 429 (the
+	// in-flight and queued requests are still parked).
+	rejected := <-results
+	if rejected.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("want 429 beyond max_queue, got %d", rejected.StatusCode)
+	}
+	if ra := rejected.Header.Get("Retry-After"); ra == "" {
+		t.Fatal("429 without Retry-After")
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rejected.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	rejected.Body.Close()
+	if et := body["error"].(map[string]any)["type"]; et != "rate_limit_error" {
+		t.Fatalf("error type %v, want rate_limit_error", et)
+	}
+
+	// Drain: first pulse frees the in-flight request, admitting the
+	// queued one; second pulse frees that.
+	up.pulse()
+	resp := <-results
+	resp.Body.Close()
+	up.pulse()
+	resp = <-results
+	resp.Body.Close()
+}
+
+// Unregistered keys get exactly the same treatment as configured ones:
+// they queue at default_concurrency (no bypass, no special casing).
+func TestUsersQueue_UnknownKeyQueuesAtDefault(t *testing.T) {
+	up := newGatingUpstream()
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := usersTestConfig(upSrv.URL, usersCfg(2, 8))
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.NewRegistry())
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	for i := 0; i < 4; i++ {
+		go func() {
+			resp := postResponses(t, proxySrv.URL, "Bearer stranger")
+			resp.Body.Close()
+		}()
+	}
+	up.waitForInFlight(t, 2) // capped at the default, not all 4 through
+	time.Sleep(50 * time.Millisecond)
+	if in, _ := up.snapshot(); in != 2 {
+		t.Fatalf("unknown key bypassed the cap: %d in flight", in)
+	}
+	for i := 0; i < 4; i++ {
+		up.pulse()
+	}
+	if _, peak := up.snapshot(); peak > 2 {
+		t.Fatalf("cap exceeded for unknown key: peak %d", peak)
+	}
+}
+
+// GET /users reports live state; PUT /users/{id} raises the limit live
+// and the queued request is admitted without any restart.
+func TestUsersQueue_ListAndLiveUpdate(t *testing.T) {
+	up := newGatingUpstream()
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	cfg := usersTestConfig(upSrv.URL, usersCfg(1, 8))
+	s := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.NewRegistry())
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	go func() {
+		resp := postResponses(t, proxySrv.URL, "Bearer dean-key")
+		resp.Body.Close()
+	}()
+	up.waitForInFlight(t, 1)
+
+	queued := make(chan int, 1)
+	go func() {
+		resp := postResponses(t, proxySrv.URL, "Bearer dean-key")
+		queued <- resp.StatusCode
+		resp.Body.Close()
+	}()
+	deadline := time.After(3 * time.Second)
+	for {
+		list := s.userReg.All()
+		if len(list) == 1 && list[0].Queued == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("request never queued")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// GET /users (via the HTTP surface, as operators see it).
+	resp, err := http.Get(proxySrv.URL + "/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listing struct {
+		Enabled            bool  `json:"enabled"`
+		DefaultConcurrency int   `json:"default_concurrency"`
+		QueueDepth         int64 `json:"queue_depth"`
+		Users              []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Concurrency int    `json:"concurrency"`
+			Active      int    `json:"active"`
+			Queued      int    `json:"queued"`
+			Requests    int64  `json:"requests_total"`
+		} `json:"users"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !listing.Enabled || listing.QueueDepth != 1 || len(listing.Users) != 1 {
+		t.Fatalf("listing wrong: %+v", listing)
+	}
+	u := listing.Users[0]
+	if u.Name != "dean" || u.Concurrency != 1 || u.Active != 1 || u.Queued != 1 || u.Requests < 2 {
+		t.Fatalf("user stats wrong: %+v", u)
+	}
+
+	// PUT /users/dean: raise to 2 — the queued request must be admitted.
+	put, _ := http.NewRequest(http.MethodPut, proxySrv.URL+"/users/dean", strings.NewReader(`{"concurrency":2}`))
+	resp, err = http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var updated struct {
+		Concurrency int `json:"concurrency"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if updated.Concurrency != 2 {
+		t.Fatalf("update not applied: %+v", updated)
+	}
+	up.waitForInFlight(t, 2)
+	up.pulse()
+	up.pulse()
+	if code := <-queued; code != 200 {
+		t.Fatalf("queued request after raise: %d", code)
+	}
+}
+
+// Feature off (the default): /users reports disabled and no limiting
+// happens — exactly today's behavior.
+func TestUsersQueue_DisabledByDefault(t *testing.T) {
+	up := newGatingUpstream()
+	upSrv := httptest.NewServer(up)
+	defer upSrv.Close()
+
+	s := newTestServer(t, upSrv.URL)
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	for i := 0; i < 3; i++ {
+		go func() {
+			resp := postResponses(t, proxySrv.URL, "Bearer dean-key")
+			resp.Body.Close()
+		}()
+	}
+	up.waitForInFlight(t, 3)
+	for i := 0; i < 3; i++ {
+		up.pulse()
+	}
+
+	resp, err := http.Get(proxySrv.URL + "/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listing map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if v, _ := listing["enabled"].(bool); v {
+		t.Fatalf("users must report disabled by default: %v", listing)
+	}
+}

@@ -31,6 +31,7 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/streaming"
 	"github.com/dncore/synapse-protocol-adapter/internal/tlscert"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
+	"github.com/dncore/synapse-protocol-adapter/internal/users"
 )
 
 // Version is stamped from main.version at startup (main gets the build
@@ -45,6 +46,8 @@ type Server struct {
 	client  *upstream.Client
 	ready   atomic.Bool
 	sem     chan struct{}
+	// userReg gates requests per API key; nil when users.enabled is false.
+	userReg *users.Registry
 	httpSrv *http.Server
 	// tlsCert is the currently served certificate; swapped atomically on
 	// SIGHUP so GetCertificate always hands out a consistent one.
@@ -58,12 +61,17 @@ type Server struct {
 
 // New constructs the server. Call Run to start it.
 func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server {
+	var userReg *users.Registry
+	if cfg.Users.Enabled {
+		userReg = users.NewRegistry(&cfg.Users)
+	}
 	s := &Server{
 		cfg:     cfg,
 		logger:  logger,
 		metrics: reg,
 		client:  upstream.NewClient(cfg),
 		sem:     newSemaphore(cfg.Limits.MaxConcurrency),
+		userReg: userReg,
 	}
 	s.ready.Store(true)
 
@@ -73,6 +81,10 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
+	// Per-user queueing surface: live state and runtime limit changes
+	// (non-persistent — the config file remains the source of truth).
+	mux.HandleFunc("GET /users", s.handleUsersList)
+	mux.HandleFunc("PUT /users/{id}", s.handleUserUpdate)
 	// Clients configured in the provider's own path style hit /api/v1/*,
 	// so both prefixes are served: /v1/responses and /api/v1/responses are
 	// the same route, letting clients migrate by swapping the host only.
@@ -163,6 +175,7 @@ func (s *Server) Run(ctx context.Context) error {
 		"tls", s.dualProto(),
 		"upstream", s.cfg.Upstream.URL(),
 		"max_concurrency", s.cfg.Limits.MaxConcurrency,
+		"user_queue", s.cfg.Users.Enabled,
 		"version", Version,
 	)
 
@@ -216,8 +229,8 @@ func (s *Server) Run(ctx context.Context) error {
 // HTTP/1.1 on both protocols, which every client negotiates fine.
 func (s *Server) makeTLSConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if c := s.tlsCert.Load(); c != nil {
 				return c, nil
@@ -358,6 +371,12 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	var sb strings.Builder
 	s.metrics.WriteText(&sb)
+	// The queue-depth gauge lives in the users registry (waiters are
+	// counted where they enqueue/leave); expose it in the same scrape.
+	if s.userReg != nil {
+		fmt.Fprintf(&sb, "# HELP protocol_proxy_queue_depth Requests currently waiting in per-user concurrency queues.\n"+
+			"# TYPE protocol_proxy_queue_depth gauge\nprotocol_proxy_queue_depth %d\n", s.userReg.Depth())
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, sb.String())
@@ -365,6 +384,60 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"version": Version})
+}
+
+// handleUsersList reports the per-user queueing state: configuration
+// summary plus each user's live slots, queue, and counters. Like the
+// other operational endpoints it is unauthenticated — see README
+// (Security) for the trusted-network model.
+func (s *Server) handleUsersList(w http.ResponseWriter, r *http.Request) {
+	if s.userReg == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":             true,
+		"default_concurrency": s.cfg.Users.DefaultConcurrency,
+		"max_queue":           s.cfg.Users.MaxQueue,
+		"queue_timeout":       s.cfg.Users.QueueTimeout.String(),
+		"queue_depth":         s.userReg.Depth(),
+		"users":               s.userReg.All(),
+	})
+}
+
+// handleUserUpdate changes one user's concurrency limit live (non-
+// persistent: a restart restores the config file's value). {id} is the
+// hash prefix shown by GET /users or the configured name.
+func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.userReg == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "per-user queueing is disabled (users.enabled is false)",
+		})
+		return
+	}
+	u := s.userReg.Find(r.PathValue("id"))
+	if u == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown user"})
+		return
+	}
+	var body struct {
+		Concurrency int `json:"concurrency"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON: {\"concurrency\": N}"})
+		return
+	}
+	if body.Concurrency < 1 || body.Concurrency > 1_000_000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "concurrency must be between 1 and 1000000"})
+		return
+	}
+	u.SetLimit(body.Concurrency)
+	s.logger.Info("user concurrency updated",
+		"request_id", middleware.RequestIDOf(r),
+		"name", u.Snapshot().Name,
+		"concurrency", body.Concurrency,
+	)
+	writeJSON(w, http.StatusOK, u.Snapshot())
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -408,12 +481,56 @@ func (s *Server) acquireSlot(r *http.Request) func() {
 	}
 }
 
+// enterUser gates a request through its API key's per-user concurrency
+// queue. It runs BEFORE the global semaphore so requests waiting in a
+// user queue hold no global slot (one user's backlog cannot starve the
+// others). Returns the release func, or nil when the request was
+// answered already (429) or the client went away while queued.
+func (s *Server) enterUser(w http.ResponseWriter, r *http.Request) func() {
+	if s.userReg == nil {
+		return func() {} // feature disabled
+	}
+	u := s.userReg.Identify(r.Header)
+	waited, err := u.Acquire(r.Context())
+	if err != nil {
+		switch err {
+		case users.ErrQueueFull:
+			s.rejectQueued(w, "queue_full",
+				"user concurrency queue is full; retry after in-flight requests finish")
+		case users.ErrQueueTimeout:
+			s.rejectQueued(w, "queue_timeout",
+				"request waited past users.queue_timeout in the concurrency queue")
+		default: // client canceled while queued
+			s.metrics.ErrorsTotal.With("client_canceled").Inc()
+		}
+		return nil
+	}
+	if waited > 0 {
+		s.metrics.QueuedRequestsTotal.Inc()
+		s.metrics.QueueWait.Observe(waited.Seconds())
+	}
+	return u.Release
+}
+
+// rejectQueued answers a queue rejection with 429 + Retry-After.
+func (s *Server) rejectQueued(w http.ResponseWriter, reason, msg string) {
+	s.metrics.QueueRejectedTotal.With(reason).Inc()
+	w.Header().Set("Retry-After", "1")
+	s.writeProxyError(w, http.StatusTooManyRequests, msg)
+}
+
 // handleResponses is the whole protocol conversion pipeline.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.metrics.RequestsTotal.Inc()
 	s.metrics.ActiveRequests.Inc()
 	defer s.metrics.ActiveRequests.Dec()
+
+	releaseUser := s.enterUser(w, r)
+	if releaseUser == nil {
+		return
+	}
+	defer releaseUser()
 
 	release := s.acquireSlot(r)
 	if release == nil {
@@ -667,6 +784,8 @@ func (s *Server) forwardUpstreamError(w http.ResponseWriter, resp *http.Response
 func (s *Server) writeProxyError(w http.ResponseWriter, status int, msg string) {
 	errType := "server_error"
 	switch {
+	case status == http.StatusTooManyRequests:
+		errType = "rate_limit_error"
 	case status >= 400 && status < 500:
 		errType = "invalid_request_error"
 	case status == http.StatusBadGateway || status == http.StatusGatewayTimeout:

@@ -29,13 +29,14 @@ Custom LLM Provider                 (speaks Chat Completions API)
 
 It is a **transparent protocol adapter** — nothing more:
 
-- ❌ No API key management — never generates, stores, or rewrites credentials
+- ❌ No credential handling — never generates, stores, or rewrites API keys; `Authorization` is always forwarded verbatim (the optional per-user queueing below registers keys as **hashes only**)
 - ❌ No accounts, OAuth, billing, or key pools
 - ❌ No session/conversation storage — fully stateless across restarts
 - ✅ Forwards client `Authorization` and all other headers **verbatim** to upstream
 - ✅ True chunk-by-chunk SSE streaming with immediate flush
 - ✅ Client disconnect cancels the upstream request immediately
 - ✅ Optional TLS on the listener (`server.tls`) — HTTP and HTTPS served on one port (auto-detected per connection), self-signed CA auto-generated or bring-your-own, for agents that require `https://` base URLs
+- ✅ Optional per-API-key concurrency queueing (`users`) — each key gets a FIFO queue with a live-adjustable concurrency cap, so no single user can trip the upstream's per-key 429s
 - ✅ Single static binary · Docker · systemd · graceful drain on SIGTERM
 
 ## Architecture
@@ -67,7 +68,8 @@ It is a **transparent protocol adapter** — nothing more:
                         │  listener: plain HTTP - or dual HTTP+HTTPS per connection:     │
                         │  (server.tls: auto self-signed CA / your cert)                 │
                         │  middleware: request-id -> access-log -> recover               │
-                        │  ops: /health /ready /metrics   lifecycle: graceful shutdown   │
+                        │  users: per-key FIFO queue -> concurrency cap (optional)       │
+                        │  ops: /health /ready /metrics /users  lifecycle: graceful stop │
                         └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -203,6 +205,11 @@ go run ./tests/load -url http://127.0.0.1:8787/v1/responses \
 In production the LLM provider is the bottleneck by 2–4 orders of
 magnitude; the proxy layer stays out of the way.
 
+Optional per-user queueing (when enabled) adds sub-microsecond costs per
+request — measured numbers in
+[Per-user concurrency queueing → Queueing overhead](#queueing-overhead-measured);
+it does not change the throughput ceiling.
+
 Runtime observability is built in: `/metrics` exposes request, upstream,
 and first-byte latency histograms (p50/p95/p99 derivable) plus gauges
 for active connections/requests — so you can capture the same numbers
@@ -218,6 +225,8 @@ against your real provider at any time.
 | `GET /ready` | Readiness — 503 once shutdown begins |
 | `GET /metrics` | Prometheus text format |
 | `GET /version` | Build version |
+| `GET /users` | Per-user queueing: live slots, queues, limits of every registered key (see [Per-user concurrency queueing](#per-user-concurrency-queueing)) |
+| `PUT /users/{id}` | Change one user's concurrency limit live (non-persistent) |
 | `GET /ca.pem` | The generated CA certificate (only with `server.tls` auto mode) — client-trust bootstrap |
 | `GET /tls-help` | Per-OS CA import walkthrough with this daemon's address baked in (only with `server.tls`) |
 | `GET /` | Endpoint listing |
@@ -354,6 +363,11 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `limits.max_concurrency` | `200` | `PROXY_LIMITS_MAX_CONCURRENCY` | Max in-flight requests; others queue (backpressure). `0` = unlimited |
 | `limits.max_body_bytes` | `67108864` | `PROXY_LIMITS_MAX_BODY_BYTES` | Max client request body (bytes) |
 | `limits.max_sse_line_bytes` | `16777216` | — | Max single SSE data line (large tool arguments) |
+| `users.enabled` | `false` | `PROXY_USERS_ENABLED` | Turn per-API-key queueing on (see [Per-user concurrency queueing](#per-user-concurrency-queueing)); off = no limiting at all |
+| `users.default_concurrency` | `90` | `PROXY_USERS_DEFAULT_CONCURRENCY` | Per-user concurrent-upstream cap (streaming holds its slot until the last byte) |
+| `users.max_queue` | `128` | `PROXY_USERS_MAX_QUEUE` | Per-user queue depth; beyond it the proxy answers 429 + `Retry-After`. `0` = unlimited |
+| `users.queue_timeout` | `120s` | `PROXY_USERS_QUEUE_TIMEOUT` | Max queue wait before the proxy answers 429 |
+| `users.keys` | `[]` | — | Optional per-user names and concurrency overrides; every key queues at `default_concurrency` whether listed or not |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | Total per-request ceiling (long generations) |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | Idle keep-alive connections |
@@ -370,6 +384,107 @@ synapse check-config --config config.yaml
 ```
 
 Invalid configuration exits non-zero with the exact field and expectation.
+
+## Per-user concurrency queueing
+
+**Opt-in** (`users.enabled: true`; the default is off — off means today's
+behavior, no limiting at all). When on, each client API key identifies a
+user, and each user's concurrent **upstream** requests are capped at a
+configurable limit (default 90, sized just under gateways that start
+429ing around 100 concurrent requests per key). Requests beyond the cap
+wait in a per-user FIFO queue; the moment a slot frees — including the
+last byte of a streaming response — the next queued request takes it, so
+the upstream sees that user's concurrency pinned at the cap instead of
+oscillating into 429s.
+
+```yaml
+users:
+  enabled: true
+  default_concurrency: 90     # per-key cap; streaming holds its slot to the last byte
+  max_queue: 128              # per-user queue depth; beyond → 429 + Retry-After
+  queue_timeout: 120s         # max queue wait; beyond → 429
+  keys:                       # optional: names + per-user overrides
+    - name: dean
+      key: "Bearer sk-live-..."   # hashed at load — plaintext never persists
+      concurrency: 90             # 0/omitted = default_concurrency
+    - name: ci
+      key_hash: "sha256:9f3a…64-hex"   # or register the hash from the start
+```
+
+Semantics worth knowing:
+
+- **Identity** = sha256 of the credential (`Authorization` first, then
+  `x-api-key`/`api-key` for Anthropic-style clients). Raw `key:` entries
+  are hashed at load and wiped — `synapse check-config` output, logs, and
+  `/users` only ever show the hash prefix. Compute a `key_hash` yourself:
+  `printf %s "Bearer sk-…" | sha256sum`.
+- **Every key queues the same way** — listing a key in `users.keys` is
+  never required for limiting, only for naming it or overriding its
+  limit. Unlisted keys (and requests with no credential at all, which
+  share one anonymous bucket) auto-register at `default_concurrency`.
+- **Slots are held for the whole request**, streaming included — "90
+  concurrent" means 90 generations in flight, not 90 connections.
+- **Ordering with the global cap**: the per-user gate runs *before*
+  `limits.max_concurrency`, so requests waiting in a user queue hold no
+  global slot — one user's backlog cannot starve the others. Keep the
+  global cap as a process-wide fuse (≥ the sum of expected user limits,
+  or `0`); per-user caps are the real admission control.
+- **429s carry `Retry-After: 1`** and a `rate_limit_error` body, both
+  for queue overflow (`max_queue`) and queue timeout (`queue_timeout`).
+- **Runtime changes are non-persistent**: `PUT`/`synapse users set`
+  applies live (raising the limit immediately admits queued requests;
+  lowering lets in-flight requests drain — nothing is preempted), and a
+  restart restores the config file's values.
+- **Single instance**: queue state is in-memory. With multiple replicas
+  behind a load balancer each replica counts independently (effective
+  limit × replicas) unless traffic is pinned per key. Auto-registered
+  users live for the process lifetime (~0.5 KB each).
+
+Live state and control:
+
+```bash
+synapse users list
+# enabled: default concurrency 90, max queue 128, queue timeout 2m0s
+# queue depth: 0
+#
+# ID                NAME  LIMIT  ACTIVE  QUEUED  REQUESTS  WAITED  REJECTED  LAST SEEN
+# 324be32f05afb4f5  dean      90       3       1       456       8         0  2026-09-10 13:47
+
+synapse users set --concurrency 6 dean     # live, no restart
+```
+
+Or over HTTP: `GET /users` for the same data as JSON, `PUT /users/dean`
+with `{"concurrency": 6}` to change a limit. Prometheus gets the
+aggregate view (`protocol_proxy_queued_requests_total`,
+`protocol_proxy_queue_wait_seconds`, `protocol_proxy_queue_rejected_total{reason}`,
+`protocol_proxy_queue_depth`); per-user detail lives in `GET /users`
+(kept out of `/metrics` to bound label cardinality).
+
+### Queueing overhead (measured)
+
+The gate costs effectively nothing next to an LLM round trip:
+
+| Operation | Cost |
+|---|---|
+| Identify (sha256 of the credential + registry lookup) | ~77 ns |
+| Acquire/Release slot handoff (contended, one user) | ~505 ns |
+| Queued request park + wake on release | single-digit µs |
+| Memory per registered user | ~0.5 KB |
+| Memory per queued request (parked goroutine + connection buffers) | ~10–30 KB |
+
+On the proxy's ~35k req/s ceiling that is ≤ ~0.02% of request time;
+against real LLM latencies (seconds to minutes) it is unmeasurable. The
+real cost of queueing is **wait time itself**: with a 90-slot cap and
+2-minute streams, a burst's tail waits in multiples of the stream
+duration. Two consequences:
+
+- `queue_timeout` (default 120s) exists because queued requests cannot
+  receive *any* bytes — not even SSE keep-alives — until admitted; the
+  proxy must fail them before clients time out and retry on their own
+  (retries otherwise pile onto the queue).
+- `max_queue` (default 128) bounds memory: each queued request parks a
+  goroutine and holds its connection. 128 × ~20 KB ≈ 2.5 MB per user at
+  full backlog.
 
 ## Docker
 
@@ -719,6 +834,15 @@ Metrics (all low-cardinality; never any header, credential, or prompt data):
 | `protocol_proxy_request_duration_seconds` | histogram | end-to-end latency |
 | `protocol_proxy_upstream_duration_seconds` | histogram | time to upstream response headers |
 | `protocol_proxy_first_byte_latency_seconds` | histogram | request start → first SSE event flushed |
+| `protocol_proxy_queued_requests_total` | counter | requests that waited in a per-user queue |
+| `protocol_proxy_queue_wait_seconds` | histogram | time spent waiting in a per-user queue |
+| `protocol_proxy_queue_rejected_total{reason}` | counter | 429s from queue overflow / timeout |
+| `protocol_proxy_queue_depth` | gauge | requests waiting in per-user queues right now |
+
+(Per-user detail — slots, queues, limits per key — is on `GET /users`, not
+in `/metrics`, to keep label cardinality bounded. The queue counters read
+zero while queueing is off; `protocol_proxy_queue_depth` appears only with
+`users.enabled` on.)
 
 Logging is structured JSON (slog): `timestamp`, `level`, `request_id`,
 `method`, `path`, `status`, `bytes_out`, `latency_ms`. The proxy never
@@ -769,6 +893,13 @@ If you must expose it beyond a trusted network, put an authenticating
 reverse proxy in front (mTLS, OAuth2-proxy, Cloudflare Access, Tailscale
 Funnel, …) or add your own auth middleware — the middleware layer is
 isolated precisely to make that a one-file addition.
+
+The per-user queueing surface follows the same trust model: `GET /users`
+and `PUT /users/{id}` are unauthenticated like `/metrics` (anyone who can
+reach the port can read live stats or change limits). Registered keys
+entered as `key:` in the config are hashed at load — plaintext keys never
+reach the running config, logs, or any endpoint — so the config file
+itself is the only place a credential exists; keep it `0600`.
 
 ## License
 

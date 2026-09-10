@@ -5,20 +5,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
@@ -85,6 +89,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "users":
+			if err := runUsers(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "users failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
 		case "-h", "--help", "help":
 			usage()
 			return
@@ -146,6 +156,12 @@ Usage:
                                        certificate (re-signs the leaf under
                                        the same CA, live via SIGHUP)
   synapse tls list [--config PATH]     show CA, SAN registry, leaf SANs
+  synapse users list [--config PATH]   per-API-key queueing: live slots,
+                                       queues, and limits of every user
+  synapse users set [--config PATH] --concurrency N <name-or-id>
+                                       change one user's concurrency limit
+                                       live (non-persistent; config file
+                                       is the source of truth)
   synapse check-config [--config PATH] validate a config and exit
   synapse healthcheck [--url URL] [--config PATH]
                                        probe a running daemon (Docker HEALTHCHECK);
@@ -268,16 +284,11 @@ func runHealthcheck(args []string) error {
 		if err != nil {
 			return err
 		}
-		host, port, _ := net.SplitHostPort(cfg.Server.Listen)
-		if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
-			host = "127.0.0.1"
-		}
-		scheme := "http"
-		if cfg.Server.TLS.Enabled {
-			scheme = "https"
+		base, tlsOn := daemonBaseURL(cfg)
+		if tlsOn {
 			client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 		}
-		target = scheme + "://" + net.JoinHostPort(host, port) + "/health"
+		target = base + "/health"
 	} else if strings.HasPrefix(target, "https://") {
 		// Explicit https URL: a liveness self-probe must not fail on the
 		// self-signed certificate it is probing.
@@ -373,6 +384,160 @@ func runTLS(args []string) error {
 	default:
 		return fmt.Errorf("unknown tls subcommand %q (want add|list)", sub)
 	}
+}
+
+// daemonBaseURL resolves the daemon's base URL from its config (listen
+// address + TLS scheme) for local CLI-to-daemon calls. A wildcard listen
+// address means localhost. The bool reports whether TLS is on (self-
+// signed certificates must be skipped for local probes).
+func daemonBaseURL(cfg config.Config) (string, bool) {
+	host, port, _ := net.SplitHostPort(cfg.Server.Listen)
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "127.0.0.1"
+	}
+	if cfg.Server.TLS.Enabled {
+		return "https://" + net.JoinHostPort(host, port), true
+	}
+	return "http://" + net.JoinHostPort(host, port), false
+}
+
+// daemonClient builds the HTTP client for CLI-to-daemon calls.
+func daemonClient(tlsOn bool) *http.Client {
+	c := &http.Client{Timeout: 5 * time.Second}
+	if tlsOn {
+		c.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	return c
+}
+
+// runUsers manages per-API-key queueing against the running daemon:
+//
+//	synapse users list                 live state of every user
+//	synapse users set <name> --concurrency N
+//	                                   change one limit live (non-persistent)
+func runUsers(args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: synapse users list [--config PATH]\n"+
+			"       synapse users set [--config PATH] --concurrency N <name-or-id>\n"+
+			"       (flags go before the reference)")
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("users "+sub, flag.ContinueOnError)
+	configPath := fs.String("config", defaultServiceConfig(), "config file the daemon runs with")
+	concurrency := fs.Int("concurrency", 0, "new concurrency limit (users set)")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	path := *configPath
+	if _, err := os.Stat(path); err != nil {
+		path = "" // absent: fall back to defaults + env
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	base, tlsOn := daemonBaseURL(cfg)
+	client := daemonClient(tlsOn)
+
+	switch sub {
+	case "list":
+		resp, err := client.Get(base + "/users")
+		if err != nil {
+			return fmt.Errorf("daemon unreachable at %s: %w (is it running?)", base, err)
+		}
+		defer resp.Body.Close()
+		var listing struct {
+			Enabled            bool   `json:"enabled"`
+			DefaultConcurrency int    `json:"default_concurrency"`
+			MaxQueue           int    `json:"max_queue"`
+			QueueTimeout       string `json:"queue_timeout"`
+			QueueDepth         int64  `json:"queue_depth"`
+			Users              []struct {
+				ID          string    `json:"id"`
+				Name        string    `json:"name"`
+				Concurrency int       `json:"concurrency"`
+				Active      int       `json:"active"`
+				Queued      int       `json:"queued"`
+				Requests    int64     `json:"requests_total"`
+				QueuedTotal int64     `json:"queued_total"`
+				Rejected    int64     `json:"rejected_total"`
+				LastSeen    time.Time `json:"last_seen"`
+			} `json:"users"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+			return err
+		}
+		if !listing.Enabled {
+			fmt.Println("per-user queueing is disabled (users.enabled is false)")
+			return nil
+		}
+		fmt.Printf("enabled: default concurrency %d, max queue %d, queue timeout %s\n",
+			listing.DefaultConcurrency, listing.MaxQueue, listing.QueueTimeout)
+		fmt.Printf("queue depth: %d\n\n", listing.QueueDepth)
+		tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tNAME\tLIMIT\tACTIVE\tQUEUED\tREQUESTS\tWAITED\tREJECTED\tLAST SEEN")
+		for _, u := range listing.Users {
+			last := "-"
+			if !u.LastSeen.IsZero() {
+				last = u.LastSeen.Format("2006-01-02 15:04:05")
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
+				u.ID, u.Name, u.Concurrency, u.Active, u.Queued, u.Requests, u.QueuedTotal, u.Rejected, last)
+		}
+		return tw.Flush()
+
+	case "set":
+		if fs.NArg() != 1 {
+			return errors.New("usage: synapse users set --concurrency N <name-or-id> (flags go before the reference)")
+		}
+		if *concurrency < 1 {
+			return errors.New("--concurrency must be >= 1")
+		}
+		body, _ := json.Marshal(map[string]int{"concurrency": *concurrency})
+		req, err := http.NewRequest(http.MethodPut, base+"/users/"+url.PathEscape(fs.Arg(0)), bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("daemon unreachable at %s: %w (is it running?)", base, err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Concurrency int    `json:"concurrency"`
+			Active      int    `json:"active"`
+			Queued      int    `json:"queued"`
+			Error       string `json:"error"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return fmt.Errorf("daemon answered %d with unreadable body", resp.StatusCode)
+		}
+		switch resp.StatusCode {
+		case http.StatusOK:
+			fmt.Printf("updated %s (%s): concurrency %d — active %d, queued %d\n",
+				orDefaultLabel(out.Name, out.ID), out.ID, out.Concurrency, out.Active, out.Queued)
+			return nil
+		case http.StatusConflict:
+			return errors.New(out.Error + " — enable it in the config and restart")
+		case http.StatusNotFound:
+			return fmt.Errorf("no user matches %q (see `synapse users list`)", fs.Arg(0))
+		default:
+			return fmt.Errorf("daemon answered %d: %s", resp.StatusCode, orDefaultLabel(out.Error, "update failed"))
+		}
+
+	default:
+		return fmt.Errorf("unknown users subcommand %q (want list|set)", sub)
+	}
+}
+
+func orDefaultLabel(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 func newLogger(cfg config.Log) *slog.Logger {

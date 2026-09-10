@@ -1,7 +1,10 @@
 # synapse example configuration.
 #
-# This file contains NO credentials: the proxy forwards the client's
-# Authorization header verbatim and never stores API keys.
+# The proxy forwards the client's Authorization header verbatim and needs
+# no credentials to run. The only optional exception is users.keys below:
+# registering keys there for per-user queueing stores them hashed (never
+# in plaintext) — or use key_hash from the start and keep even the config
+# file credential-free.
 
 server:
   # Listen address. 0.0.0.0 exposes the proxy to the LAN (see README:
@@ -49,6 +52,37 @@ limits:
   # Max single SSE data line (large tool arguments arrive as one line).
   max_sse_line_bytes: 16777216    # 16 MiB
 
+# Per-API-key concurrency queueing. Opt-in: absent or enabled:false means
+# no per-user limiting (all requests pass as before). When enabled, EVERY
+# key — listed or not — queues at the same default limit; there is no
+# unregistered-key bypass.
+users:
+  enabled: false
+  # Concurrent upstream requests allowed per user. Requests beyond this
+  # wait in a FIFO queue instead of hitting the upstream's own limits.
+  # A streaming request holds its slot until the last byte. Default 90:
+  # just under gateways that 429 around 100 concurrent requests per key.
+  default_concurrency: 90
+  # Requests per user that may wait for a slot; beyond this the proxy
+  # answers 429 immediately with Retry-After. 0 = unlimited queue.
+  max_queue: 128
+  # Max time a request may wait in the queue before the proxy answers 429.
+  # Queued requests cannot receive any bytes (not even SSE keep-alives),
+  # so this must end before clients time out and retry on their own.
+  queue_timeout: 120s
+  # Optional per-user names and concurrency overrides. Listing is never
+  # required for limiting — every key queues at default_concurrency. Give
+  # a raw key (hashed at load — plaintext never persists in the running
+  # config or logs) or a sha256:<64 hex> hash computed with, e.g.,
+  #   printf %s "Bearer sk-..." | sha256sum
+  keys: []
+  # keys:
+  #   - name: dean
+  #     key: "Bearer sk-live-..."
+  #     concurrency: 90
+  #   - name: ci
+  #     key_hash: "sha256:9f3a...64hex"
+
 timeouts:
   connect: 10s        # TCP/TLS connect to upstream
   request: 30m        # total per-request ceiling (long generations)
@@ -70,6 +104,8 @@ log:
 #   PROXY_SERVER_TLS_AUTO_DIR, PROXY_SERVER_TLS_SANS (comma-separated),
 #   PROXY_UPSTREAM_BASE_URL, PROXY_UPSTREAM_PATH,
 #   PROXY_LIMITS_MAX_CONCURRENCY, PROXY_LIMITS_MAX_BODY_BYTES,
+#   PROXY_USERS_ENABLED, PROXY_USERS_DEFAULT_CONCURRENCY,
+#   PROXY_USERS_MAX_QUEUE, PROXY_USERS_QUEUE_TIMEOUT,
 #   PROXY_TIMEOUTS_CONNECT, PROXY_TIMEOUTS_REQUEST, PROXY_TIMEOUTS_IDLE,
 #   PROXY_TIMEOUTS_STREAM_WRITE, PROXY_SHUTDOWN_TIMEOUT,
 #   PROXY_LOG_FORMAT, PROXY_LOG_LEVEL
