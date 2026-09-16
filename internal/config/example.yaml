@@ -83,6 +83,18 @@ users:
   #   - name: ci
   #     key_hash: "sha256:9f3a...64hex"
 
+upstream_retry:
+  # Absorb transient upstream 429s with bounded, slot-holding retries.
+  # Only 429 is retried, and only before any byte reached the client.
+  enabled: true
+  max_attempts: 5           # total upstream attempts, first included
+  initial_backoff: 1s       # doubles per 429; upstream Retry-After wins
+  max_backoff: 15s          # per-wait cap (also clamps Retry-After)
+  budget: 60s               # total wait spent between attempts
+  buffer_max_bytes: 4194304 # passthrough bodies up to this size are
+                            # buffered so they can be replayed on retry;
+                            # larger or chunked bodies stream (no retry)
+
 timeouts:
   connect: 10s        # TCP/TLS connect to upstream
   request: 30m        # total per-request ceiling (long generations)
@@ -106,6 +118,9 @@ log:
 #   PROXY_LIMITS_MAX_CONCURRENCY, PROXY_LIMITS_MAX_BODY_BYTES,
 #   PROXY_USERS_ENABLED, PROXY_USERS_DEFAULT_CONCURRENCY,
 #   PROXY_USERS_MAX_QUEUE, PROXY_USERS_QUEUE_TIMEOUT,
+#   PROXY_UPSTREAM_RETRY_ENABLED, PROXY_UPSTREAM_RETRY_MAX_ATTEMPTS,
+#   PROXY_UPSTREAM_RETRY_INITIAL_BACKOFF, PROXY_UPSTREAM_RETRY_MAX_BACKOFF,
+#   PROXY_UPSTREAM_RETRY_BUDGET, PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES,
 #   PROXY_TIMEOUTS_CONNECT, PROXY_TIMEOUTS_REQUEST, PROXY_TIMEOUTS_IDLE,
 #   PROXY_TIMEOUTS_STREAM_WRITE, PROXY_SHUTDOWN_TIMEOUT,
 #   PROXY_LOG_FORMAT, PROXY_LOG_LEVEL

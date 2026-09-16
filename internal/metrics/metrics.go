@@ -28,6 +28,9 @@ type Registry struct {
 	UpstreamConnections      *Counter
 	QueuedRequestsTotal      *Counter
 	QueueRejectedTotal       *LabeledCounter
+	Upstream429Total         *LabeledCounter
+	RetriesAbsorbedTotal     *Counter
+	RetryExhaustedTotal      *Counter
 
 	// Gauges.
 	ActiveConnections *Gauge
@@ -57,6 +60,9 @@ func NewRegistry() *Registry {
 		UpstreamConnections:      &Counter{Name: "protocol_proxy_upstream_requests_total", Help: "Total requests issued to upstream."},
 		QueuedRequestsTotal:      &Counter{Name: "protocol_proxy_queued_requests_total", Help: "Requests that waited in a per-user concurrency queue before being admitted."},
 		QueueRejectedTotal:       &LabeledCounter{Name: "protocol_proxy_queue_rejected_total", Help: "Requests rejected by per-user queueing, by reason.", Label: "reason"},
+		Upstream429Total:         &LabeledCounter{Name: "protocol_proxy_upstream_429_total", Help: "HTTP 429 responses received from the upstream, by route.", Label: "route"},
+		RetriesAbsorbedTotal:     &Counter{Name: "protocol_proxy_429_absorbed_total", Help: "Upstream 429s absorbed by a retry (each retry issued)."},
+		RetryExhaustedTotal:      &Counter{Name: "protocol_proxy_429_exhausted_total", Help: "Requests that gave up waiting after their retry budget was exhausted."},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -181,6 +187,8 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeCounter(r.BytesOutTotal, "")
 	writeCounter(r.UpstreamConnections, "")
 	writeCounter(r.QueuedRequestsTotal, "")
+	writeCounter(r.RetriesAbsorbedTotal, "")
+	writeCounter(r.RetryExhaustedTotal, "")
 
 	writeLabeled := func(lc *LabeledCounter) {
 		fmt.Fprintf(sb, "# HELP %s %s\n# TYPE %s counter\n", lc.Name, lc.Help, lc.Name)
@@ -202,6 +210,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeLabeled(r.ErrorsTotal)
 	writeLabeled(r.UpstreamErrorsTotal)
 	writeLabeled(r.QueueRejectedTotal)
+	writeLabeled(r.Upstream429Total)
 
 	writeGauge := func(g *Gauge) {
 		fmt.Fprintf(sb, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", g.Name, g.Help, g.Name, g.Name, g.v.Load())

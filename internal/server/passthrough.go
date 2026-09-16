@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -45,24 +46,36 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	// The request body is never parsed or buffered here; it streams to the
-	// upstream with a counting wrapper for metrics.
-	body := &countingReader{r: r.Body, total: s.metrics.BytesInTotal}
+	// Small bodies (declared Content-Length within the retry buffer) are
+	// read into memory so a transient 429 can be retried with the same
+	// bytes; larger or length-less bodies stream straight through, exactly
+	// as before, and are not retried.
+	buffered, err := s.replayableBody(r)
+	if err != nil {
+		s.metrics.ErrorsTotal.With("client_canceled").Inc()
+		return // client aborted while sending its body
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeouts.Request)
 	defer cancel()
 
 	upStart := time.Now()
-	// /api/anthropic/* keeps its full path against the upstream host
-	// root; the /v1 styles strip their prefix onto the base_url.
-	var resp *http.Response
-	var err error
-	if strings.HasPrefix(r.URL.Path, "/api/anthropic/") {
-		resp, err = s.client.DoPassthroughRoot(ctx, r.Method, r.URL.Path, r.URL.RawQuery, body, r.Header)
-	} else {
-		resp, err = s.client.DoPassthrough(ctx, r.Method,
+	attempt := func() (*http.Response, error) {
+		var body io.Reader
+		if buffered != nil {
+			body = bytes.NewReader(buffered)
+		} else {
+			body = &countingReader{r: r.Body, total: s.metrics.BytesInTotal}
+		}
+		// /api/anthropic/* keeps its full path against the upstream host
+		// root; the /v1 styles strip their prefix onto the base_url.
+		if strings.HasPrefix(r.URL.Path, "/api/anthropic/") {
+			return s.client.DoPassthroughRoot(ctx, r.Method, r.URL.Path, r.URL.RawQuery, body, r.Header)
+		}
+		return s.client.DoPassthrough(ctx, r.Method,
 			stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
 	}
+	resp, err := s.doUpstreamRetry(ctx, r, "passthrough", buffered != nil, attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -79,6 +92,14 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	s.metrics.UpstreamConnections.Inc()
 	s.metrics.UpstreamDuration.Observe(time.Since(upStart).Seconds())
+
+	if resp.StatusCode == http.StatusTooManyRequests && s.cfg.UpstreamRetry.Enabled {
+		// A 429 that survived the retry budget (or a non-replayable
+		// body): answer with Retry-After instead of mirroring it bare.
+		s.metrics.UpstreamErrorsTotal.With("http_4xx").Inc()
+		s.rejectUpstream429(w, resp)
+		return
+	}
 
 	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
 	if resp.Uncompressed {
@@ -127,6 +148,24 @@ func stripAPIPrefix(p string) string {
 		return strings.TrimPrefix(p, "/api/v1")
 	}
 	return strings.TrimPrefix(p, "/v1")
+}
+
+// replayableBody returns the request body verbatim when it is small enough
+// and its length is known (Content-Length within buffer_max_bytes), so the
+// passthrough route can re-send it after an upstream 429. When it returns
+// nil the caller streams r.Body as before and the request is not retried.
+func (s *Server) replayableBody(r *http.Request) ([]byte, error) {
+	rc := s.cfg.UpstreamRetry
+	if !rc.Enabled || rc.BufferMaxBytes <= 0 || r.Body == nil ||
+		r.ContentLength < 0 || r.ContentLength > int64(rc.BufferMaxBytes) {
+		return nil, nil
+	}
+	buf := make([]byte, r.ContentLength)
+	if _, err := io.ReadFull(r.Body, buf); err != nil {
+		return nil, err
+	}
+	s.metrics.BytesInTotal.Add(r.ContentLength)
+	return buf, nil
 }
 
 // countingReader streams through while tallying bytes into a counter.

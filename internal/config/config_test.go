@@ -347,3 +347,55 @@ func TestValidate_TLSErrors(t *testing.T) {
 		t.Fatalf("valid tls config rejected: %v", err)
 	}
 }
+
+func TestValidate_UpstreamRetryErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"attempts below one", func(c *Config) { c.UpstreamRetry.MaxAttempts = 0 }, "max_attempts"},
+		{"zero initial backoff", func(c *Config) { c.UpstreamRetry.InitialBackoff = 0 }, "initial_backoff"},
+		{"max backoff below initial", func(c *Config) { c.UpstreamRetry.MaxBackoff = time.Millisecond }, "max_backoff"},
+		{"zero budget", func(c *Config) { c.UpstreamRetry.Budget = 0 }, "budget"},
+		{"negative buffer", func(c *Config) { c.UpstreamRetry.BufferMaxBytes = -1 }, "buffer_max_bytes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			tc.mut(&cfg)
+			err := Validate(&cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error mentioning %q, got %v", tc.want, err)
+			}
+		})
+	}
+
+	cfg := Defaults()
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("default upstream_retry rejected: %v", err)
+	}
+	if !cfg.UpstreamRetry.Enabled || cfg.UpstreamRetry.MaxAttempts != 5 ||
+		cfg.UpstreamRetry.InitialBackoff != time.Second || cfg.UpstreamRetry.Budget != time.Minute {
+		t.Fatalf("unexpected upstream_retry defaults: %+v", cfg.UpstreamRetry)
+	}
+}
+
+func TestWarnings_QueueTimeout(t *testing.T) {
+	cfg := Defaults()
+	cfg.Users.Enabled = true
+	cfg.Users.QueueTimeout = 120 * time.Second
+	ws := cfg.Warnings()
+	if len(ws) != 1 || !strings.Contains(ws[0], "users.queue_timeout") {
+		t.Fatalf("want a queue_timeout warning, got %v", ws)
+	}
+	cfg.Users.QueueTimeout = 60 * time.Second
+	if got := cfg.Warnings(); len(got) != 0 {
+		t.Fatalf("60s must not warn: %v", got)
+	}
+	cfg.Users.Enabled = false
+	cfg.Users.QueueTimeout = 120 * time.Second
+	if got := cfg.Warnings(); len(got) != 0 {
+		t.Fatalf("disabled queueing must not warn: %v", got)
+	}
+}

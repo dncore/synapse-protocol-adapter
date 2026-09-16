@@ -24,6 +24,11 @@ func testConfig(upstreamURL string) config.Config {
 	cfg := config.Defaults()
 	cfg.Upstream.BaseURL = upstreamURL
 	cfg.Limits.MaxConcurrency = 200
+	// Same 429-absorption semantics as production, but with test-scale
+	// timings so a retry sequence costs milliseconds, not half a minute.
+	cfg.UpstreamRetry.InitialBackoff = time.Millisecond
+	cfg.UpstreamRetry.MaxBackoff = 4 * time.Millisecond
+	cfg.UpstreamRetry.Budget = 2 * time.Second
 	return cfg
 }
 
@@ -236,7 +241,7 @@ func TestProxy_ToolCallsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(out.Output) != 1 || out.Output[0].Type != "function_call" || out.Output[0].CallID != "call_9" ||
-		out.Output[0].Name != "get_weather" || out.Output[0].Arguments != `{"city":"SF"}` {
+		out.Output[0].Name != "get_weather" || *out.Output[0].Arguments != `{"city":"SF"}` {
 		t.Fatalf("tool call round trip broken: %+v", out.Output)
 	}
 }

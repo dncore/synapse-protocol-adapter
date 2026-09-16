@@ -34,6 +34,7 @@ Custom LLM Provider                 (Chat Completions API)
 - ✅ 客户端断开立即取消 upstream 请求
 - ✅ 监听可选 TLS（`server.tls`）——HTTP 与 HTTPS 同端口共存（按连接自动识别），自动生成自签名 CA 或自带证书，供强制 `https://` base_url 的 agent 使用
 - ✅ 可选按 API Key 并发排队（`users`）——每个 Key 一条 FIFO 队列 + 可运行时调整的并发上限，单个用户永远不会触发 upstream 的按 Key 429
+- ✅ 上游瞬时 429 吸收（`upstream_retry`，默认开启）——有界退避重试、尊重 `Retry-After`、重试期间继续占槽背压；预算耗尽才把 429 + `Retry-After` 交还客户端
 - ✅ 单静态二进制 · Docker · systemd · SIGTERM 优雅退出
 
 ## 架构
@@ -347,6 +348,12 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `users.max_queue` | `128` | `PROXY_USERS_MAX_QUEUE` | 单用户排队深度；超出立即 429 + `Retry-After`。`0` = 不限 |
 | `users.queue_timeout` | `120s` | `PROXY_USERS_QUEUE_TIMEOUT` | 排队等待上限；超出 429 |
 | `users.keys` | `[]` | — | 可选的每用户命名与并发覆盖；列不列出都按 `default_concurrency` 排队 |
+| `upstream_retry.enabled` | `true` | `PROXY_UPSTREAM_RETRY_ENABLED` | 吸收上游瞬时 429（见[上游 429 吸收](#上游-429-吸收upstream_retry)）；关闭 = 429 原样透传 |
+| `upstream_retry.max_attempts` | `5` | `PROXY_UPSTREAM_RETRY_MAX_ATTEMPTS` | 上游尝试总数（含首次）；`1` = 不重试 |
+| `upstream_retry.initial_backoff` | `1s` | `PROXY_UPSTREAM_RETRY_INITIAL_BACKOFF` | 首次退避，逐次翻倍；上游带 `Retry-After` 时优先采用 |
+| `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | 单次退避上限（同时约束 `Retry-After`） |
+| `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | 重试等待总预算；超出即把最后一个 429 交给客户端 |
+| `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | passthrough 可重放缓冲上限；更大的或长度未知的请求体流式直通、不重试 |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | 单请求总时长上限（长生成） |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | keep-alive 空闲连接超时 |
@@ -453,6 +460,50 @@ HTTP 等价面：`GET /users` 返回同样的 JSON，`PUT /users/dean` 携带
   重试之前拒绝它们（否则重试会继续堆积进队列）。
 - `max_queue`（默认 128）限制内存：每个排队请求驻留一个 goroutine 并
   占住一条连接。满队列时 128 × ~20 KB ≈ 每用户 2.5 MB。
+
+**共享凭据即总预算。** 若一台机器上所有客户端（hermes、Claude Code、
+codex……）逐字节共用同一把凭据——上游按 token 计池时的常态——那么开启
+按 Key 排队就等于给这把共享 token 加了一道**总闸门**：所有流量哈希到
+同一个用户、进同一条队列。此时建议 `default_concurrency` 直接设成想给
+自己的总预算（相对于池子留出余量，例如池子 100 时设 24–48，实测常态在
+飞仅个位数，零成本），并把 `queue_timeout` 压到明显低于客户端 socket
+读超时（推荐 60s；超过 90s 时 `check-config` 会告警）。
+
+## 上游 429 吸收（`upstream_retry`）
+
+**默认开启**（`upstream_retry.enabled: true`）。当上游返回 429——网关的
+"Too many concurrent requests"——代理不把失败直接甩给客户端，而是在有界
+退避下重发同一请求：上游带 `Retry-After` 就优先采用，否则 1/2/4/8s 指数
+退避（受 `max_backoff` 约束）。**重试期间请求继续持有用户队列与全局
+槽位**，因此退避带来的是背压而不是更多压力——风暴中队列排得慢一些，正是
+设计意图。只重试 429，且只发生在任何字节送达客户端之前：一旦 200 开始
+流式写出，响应即已提交、不再重试。
+
+预算耗尽（或 passthrough 请求体无法缓冲重放）时，客户端收到 `429` +
+`Retry-After`——与排队拒绝同一契约——并保留上游的可读错误消息，让客户端
+SDK 的重试逻辑正常接管。
+
+```yaml
+upstream_retry:
+  enabled: true
+  max_attempts: 5          # 上游尝试总数（含首次）
+  initial_backoff: 1s      # 每次 429 翻倍
+  max_backoff: 15s         # 单次上限（也约束上游 Retry-After）
+  budget: 60s              # 重试等待总预算
+  buffer_max_bytes: 4194304  # passthrough 请求体 ≤ 此值才缓冲以支持重放；
+                             # 更大或 chunked 的请求体流式直通、不重试
+```
+
+值得了解的语义：
+
+- **重试占槽。** 等待中的请求不释放并发槽位，吸收层因此不可能把预算打
+  穿——代价是风暴期间队列排空变慢。
+- **客户端取消优先。** 退避期间客户端断开，请求立即中止。
+- **指标**：`protocol_proxy_upstream_429_total{route}`（见过的每个
+  429）、`protocol_proxy_429_absorbed_total`（实际发起吸收的重试数）、
+  `protocol_proxy_429_exhausted_total`（预算耗尽的请求数）。日志：每次
+  退避一条 warn（`upstream 429; backing off`）、吸收成功一条 info、耗尽
+  一条 warn，均带 `request_id` 与 `route`。
 
 ## Docker
 

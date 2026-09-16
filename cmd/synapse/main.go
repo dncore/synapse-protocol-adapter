@@ -253,6 +253,9 @@ func runCheckConfig(args []string) error {
 		return err
 	}
 	fmt.Print(config.Describe(&cfg))
+	for _, w := range cfg.Warnings() {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 	return nil
 }
 

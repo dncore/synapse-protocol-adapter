@@ -28,13 +28,14 @@ var ExampleConfig string
 
 // Config is the full proxy configuration tree.
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Upstream Upstream `yaml:"upstream"`
-	Limits   Limits   `yaml:"limits"`
-	Users    Users    `yaml:"users"`
-	Timeouts Timeouts `yaml:"timeouts"`
-	Shutdown Shutdown `yaml:"shutdown"`
-	Log      Log      `yaml:"log"`
+	Server        Server        `yaml:"server"`
+	Upstream      Upstream      `yaml:"upstream"`
+	Limits        Limits        `yaml:"limits"`
+	Users         Users         `yaml:"users"`
+	UpstreamRetry UpstreamRetry `yaml:"upstream_retry"`
+	Timeouts      Timeouts      `yaml:"timeouts"`
+	Shutdown      Shutdown      `yaml:"shutdown"`
+	Log           Log           `yaml:"log"`
 }
 
 // Server is the listener configuration.
@@ -141,6 +142,32 @@ type UserKey struct {
 	Concurrency int `yaml:"concurrency"`
 }
 
+// UpstreamRetry absorbs transient upstream 429s (a gateway's "too many
+// concurrent requests") with bounded retries. A retry happens while the
+// request keeps holding its user-queue and global slots, so the wait
+// applies backpressure instead of piling more load on the upstream; only
+// 429 responses are retried, and only before any byte reached the client.
+type UpstreamRetry struct {
+	// Enabled turns 429 absorption on. When false a 429 is relayed to the
+	// client exactly as the upstream sent it.
+	Enabled bool `yaml:"enabled"`
+	// MaxAttempts is the total number of upstream attempts, the first one
+	// included. 1 disables retrying.
+	MaxAttempts int `yaml:"max_attempts"`
+	// InitialBackoff doubles after each absorbed 429, capped at
+	// MaxBackoff; an upstream Retry-After header overrides it (also capped).
+	InitialBackoff time.Duration `yaml:"initial_backoff"`
+	MaxBackoff     time.Duration `yaml:"max_backoff"`
+	// Budget caps the total wall time spent waiting between attempts. A
+	// retry that would start past the budget is not made and the last 429
+	// is relayed.
+	Budget time.Duration `yaml:"budget"`
+	// BufferMaxBytes is the largest request body (by Content-Length) the
+	// passthrough route buffers to stay replayable. Larger or length-less
+	// bodies stream straight through and a 429 on them is not retried.
+	BufferMaxBytes int `yaml:"buffer_max_bytes"`
+}
+
 // Timeouts tunes the HTTP server and upstream transport.
 type Timeouts struct {
 	Connect     time.Duration `yaml:"connect"`
@@ -176,6 +203,14 @@ func Defaults() Config {
 			DefaultConcurrency: 90,
 			MaxQueue:           128,
 			QueueTimeout:       120 * time.Second,
+		},
+		UpstreamRetry: UpstreamRetry{
+			Enabled:        true,
+			MaxAttempts:    5,
+			InitialBackoff: 1 * time.Second,
+			MaxBackoff:     15 * time.Second,
+			Budget:         60 * time.Second,
+			BufferMaxBytes: 4 << 20, // 4 MiB: LLM JSON bodies fit; media uploads stream
 		},
 		Timeouts: Timeouts{
 			Connect:     10 * time.Second,
@@ -306,6 +341,36 @@ func applyEnv(cfg *Config) {
 			cfg.Users.QueueTimeout = d
 		}
 	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.UpstreamRetry.Enabled = b
+		}
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_MAX_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.UpstreamRetry.MaxAttempts = n
+		}
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_INITIAL_BACKOFF"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.UpstreamRetry.InitialBackoff = d
+		}
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_MAX_BACKOFF"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.UpstreamRetry.MaxBackoff = d
+		}
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_BUDGET"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.UpstreamRetry.Budget = d
+		}
+	}
+	if v := os.Getenv("PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.UpstreamRetry.BufferMaxBytes = n
+		}
+	}
 	if v := os.Getenv("PROXY_TIMEOUTS_CONNECT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Timeouts.Connect = d
@@ -384,6 +449,9 @@ func Validate(cfg *Config) error {
 	if err := validateUsers(cfg); err != nil {
 		errs = append(errs, err)
 	}
+	if err := validateUpstreamRetry(cfg); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.Timeouts.Connect <= 0 {
 		errs = append(errs, errors.New("timeouts.connect must be > 0 (e.g. 10s)"))
 	}
@@ -411,6 +479,41 @@ func Validate(cfg *Config) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// validateUpstreamRetry checks the 429-absorption section, enabled or not.
+func validateUpstreamRetry(cfg *Config) error {
+	var errs []error
+	r := cfg.UpstreamRetry
+	if r.MaxAttempts < 1 {
+		errs = append(errs, fmt.Errorf("upstream_retry.max_attempts must be >= 1, got %d", r.MaxAttempts))
+	}
+	if r.InitialBackoff <= 0 {
+		errs = append(errs, errors.New("upstream_retry.initial_backoff must be > 0 (e.g. 1s)"))
+	}
+	if r.MaxBackoff < r.InitialBackoff {
+		errs = append(errs, fmt.Errorf("upstream_retry.max_backoff (%s) must be >= initial_backoff (%s)", r.MaxBackoff, r.InitialBackoff))
+	}
+	if r.Budget <= 0 {
+		errs = append(errs, errors.New("upstream_retry.budget must be > 0 (e.g. 60s)"))
+	}
+	if r.BufferMaxBytes < 0 {
+		errs = append(errs, fmt.Errorf("upstream_retry.buffer_max_bytes must be >= 0 (0 = passthrough never buffers), got %d", r.BufferMaxBytes))
+	}
+	return errors.Join(errs...)
+}
+
+// Warnings returns non-fatal advisories: configurations that load and run
+// but are known to misbehave in practice. `synapse check-config` prints
+// them; the server logs them at startup.
+func (c *Config) Warnings() []string {
+	var out []string
+	if c.Users.Enabled && c.Users.QueueTimeout > 90*time.Second {
+		out = append(out, fmt.Sprintf(
+			"users.queue_timeout is %s: queued requests receive no bytes at all (not even keep-alives), so the wait must end well before clients give up and retry their socket read (hermes: ~120s). 60s is the recommended ceiling.",
+			c.Users.QueueTimeout))
+	}
+	return out
 }
 
 // validateUsers checks the per-user queueing section. Validated whether or

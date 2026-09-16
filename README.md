@@ -37,6 +37,7 @@ It is a **transparent protocol adapter** — nothing more:
 - ✅ Client disconnect cancels the upstream request immediately
 - ✅ Optional TLS on the listener (`server.tls`) — HTTP and HTTPS served on one port (auto-detected per connection), self-signed CA auto-generated or bring-your-own, for agents that require `https://` base URLs
 - ✅ Optional per-API-key concurrency queueing (`users`) — each key gets a FIFO queue with a live-adjustable concurrency cap, so no single user can trip the upstream's per-key 429s
+- ✅ Transient upstream 429 absorption (`upstream_retry`, on by default) — bounded backoff retries that keep holding the concurrency slot, honoring `Retry-After`; only a spent budget hands the 429 back to the client
 - ✅ Single static binary · Docker · systemd · graceful drain on SIGTERM
 
 ## Architecture
@@ -368,6 +369,12 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `users.max_queue` | `128` | `PROXY_USERS_MAX_QUEUE` | Per-user queue depth; beyond it the proxy answers 429 + `Retry-After`. `0` = unlimited |
 | `users.queue_timeout` | `120s` | `PROXY_USERS_QUEUE_TIMEOUT` | Max queue wait before the proxy answers 429 |
 | `users.keys` | `[]` | — | Optional per-user names and concurrency overrides; every key queues at `default_concurrency` whether listed or not |
+| `upstream_retry.enabled` | `true` | `PROXY_UPSTREAM_RETRY_ENABLED` | Absorb transient upstream 429s (see [Upstream 429 absorption](#upstream-429-absorption-upstream_retry)); off relays 429s verbatim |
+| `upstream_retry.max_attempts` | `5` | `PROXY_UPSTREAM_RETRY_MAX_ATTEMPTS` | Total upstream attempts, first included; `1` disables retrying |
+| `upstream_retry.initial_backoff` | `1s` | `PROXY_UPSTREAM_RETRY_INITIAL_BACKOFF` | First backoff, doubling per 429; an upstream `Retry-After` wins |
+| `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | Per-wait cap (also clamps `Retry-After`) |
+| `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | Total time spent waiting between attempts; beyond it the last 429 goes to the client |
+| `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | Largest passthrough body buffered for replay; larger or length-less bodies stream and are not retried |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | Total per-request ceiling (long generations) |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | Idle keep-alive connections |
@@ -485,6 +492,59 @@ duration. Two consequences:
 - `max_queue` (default 128) bounds memory: each queued request parks a
   goroutine and holds its connection. 128 × ~20 KB ≈ 2.5 MB per user at
   full backlog.
+
+**A shared credential makes the per-key queue a total budget.** When every
+client on a machine (hermes, Claude Code, codex, …) sends the byte-identical
+credential — the norm when the upstream pools concurrency per token —
+enabling per-key queueing *is* a global gate for that token: all traffic
+hashes to one user and one FIFO queue. Set `default_concurrency` to the
+total budget you want (leave headroom against the pool; 24–48 is plenty
+against real in-flight counts in the single digits) and keep
+`queue_timeout` well under your clients' socket read timeout (60s
+recommended; `check-config` warns above 90s).
+
+## Upstream 429 absorption (`upstream_retry`)
+
+**On by default** (`upstream_retry.enabled: true`). When the upstream
+answers 429 — a gateway's "too many concurrent requests" — the proxy does
+not hand the failure straight to the client. It re-sends the same request
+under bounded backoff, honoring `Retry-After` when present (1/2/4/8s…
+capped at `max_backoff` otherwise). While it waits, the request keeps its
+user-queue and global slots, so the backoff applies backpressure rather
+than more pressure — the queue drains slower during a storm, by design.
+Only 429 is retried, and only before any byte reached the client: once a
+200 starts streaming, the response is committed.
+
+When the budget runs out (or a passthrough body could not be buffered for
+replay), the client gets `429` plus `Retry-After` — the same contract as
+queue rejections — with the upstream's message preserved so client SDK
+retry logic engages cleanly.
+
+```yaml
+upstream_retry:
+  enabled: true
+  max_attempts: 5          # total upstream attempts, first included
+  initial_backoff: 1s      # doubles per 429
+  max_backoff: 15s         # per-wait cap (also clamps upstream Retry-After)
+  budget: 60s              # total wait spent between attempts
+  buffer_max_bytes: 4194304  # passthrough bodies up to this size are
+                             # buffered so a 429 can be retried with the
+                             # same bytes; larger or chunked bodies stream
+                             # through and are not retried
+```
+
+Semantics worth knowing:
+
+- **A retry keeps the slot.** The waiting request never releases its
+  concurrency slot, so absorption cannot push the upstream past the
+  budget it was given; the cost is a slower-draining queue mid-storm.
+- **Client cancellation wins.** If the client disconnects during a
+  backoff, the request aborts immediately.
+- **Metrics**: `protocol_proxy_upstream_429_total{route}` (every 429
+  seen), `protocol_proxy_429_absorbed_total` (retries issued),
+  `protocol_proxy_429_exhausted_total` (gave up). Logs: one warn per
+  backoff (`upstream 429; backing off`), one info when absorbed, one warn
+  when exhausted — all carrying `request_id` and `route`.
 
 ## Docker
 

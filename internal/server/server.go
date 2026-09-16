@@ -73,6 +73,9 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 		sem:     newSemaphore(cfg.Limits.MaxConcurrency),
 		userReg: userReg,
 	}
+	for _, w := range cfg.Warnings() {
+		logger.Warn(w)
+	}
 	s.ready.Store(true)
 
 	mux := http.NewServeMux()
@@ -573,7 +576,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	upStart := time.Now()
-	resp, err := s.client.Do(ctx, chatBody, r.Header, req.Stream)
+	// The converted body is already in memory, so the attempt is always
+	// replayable: a transient upstream 429 is absorbed with bounded
+	// retries while this request keeps its queue and global slots.
+	attempt := func() (*http.Response, error) {
+		return s.client.Do(ctx, chatBody, r.Header, req.Stream)
+	}
+	resp, err := s.doUpstreamRetry(ctx, r, "convert", true, attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -593,6 +602,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if resp.StatusCode >= 400 {
 		s.metrics.UpstreamErrorsTotal.With(fmt.Sprintf("http_%dxx", resp.StatusCode/100)).Inc()
+		if resp.StatusCode == http.StatusTooManyRequests && s.cfg.UpstreamRetry.Enabled {
+			// A 429 that survived the retry budget (or attempts=1): relay
+			// it with Retry-After so client SDK backoff engages.
+			s.rejectUpstream429(w, resp)
+			return
+		}
 		s.forwardUpstreamError(w, resp)
 		return
 	}
@@ -743,15 +758,32 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 // forwardUpstreamError relays an HTTP-level upstream error to the client,
 // reshaping the body into a Responses-style error while preserving status.
 func (s *Server) forwardUpstreamError(w http.ResponseWriter, resp *http.Response) {
+	msg, errType, errCode := upstreamErrorDetails(resp)
+
+	out := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    errType,
+			"code":    errCode,
+		},
+	}
+	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// upstreamErrorDetails reads an upstream error body (bounded) and extracts
+// the human message plus OpenAI-style type/code, accepting the OpenAI
+// envelope, the FastAPI {"detail":...} envelope, or raw text.
+func upstreamErrorDetails(resp *http.Response) (msg, errType, errCode string) {
 	body, _ := upstream.ReadAllWithLimit(resp.Body, 1<<20)
 
 	var parsed completions.Error
-	msg := ""
 	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Error.Message != "" {
 		msg = parsed.Error.Message
 	}
 	if msg == "" {
-		// FastAPI-style error envelope: {"detail":"..."}.
 		var detail struct {
 			Detail string `json:"detail"`
 		}
@@ -765,18 +797,14 @@ func (s *Server) forwardUpstreamError(w http.ResponseWriter, resp *http.Response
 	if msg == "" {
 		msg = http.StatusText(resp.StatusCode)
 	}
+	return msg, orDefault(parsed.Error.Type, "upstream_error"), orDefault(parsed.Error.Code, strconv.Itoa(resp.StatusCode))
+}
 
-	out := map[string]any{
-		"error": map[string]any{
-			"message": msg,
-			"type":    orDefault(parsed.Error.Type, "upstream_error"),
-			"code":    orDefault(parsed.Error.Code, strconv.Itoa(resp.StatusCode)),
-		},
-	}
-	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	_ = json.NewEncoder(w).Encode(out)
+// upstreamErrorMessage is upstreamErrorDetails for callers that only need
+// the human-readable message.
+func upstreamErrorMessage(resp *http.Response) string {
+	msg, _, _ := upstreamErrorDetails(resp)
+	return msg
 }
 
 // writeProxyError emits a Responses-shaped error produced by the proxy

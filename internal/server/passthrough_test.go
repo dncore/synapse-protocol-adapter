@@ -105,11 +105,19 @@ func TestPassthrough_GetModels(t *testing.T) {
 }
 
 func TestPassthrough_ErrorVerbatim(t *testing.T) {
-	proxy, _ := newPassthroughTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// With 429 absorption off, the passthrough contract is absolute: the
+	// upstream's status, headers, and body pass through byte for byte.
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Upstream-Trace", "t-42")
 		w.WriteHeader(429)
 		_, _ = w.Write([]byte(`{"error":{"message":"rate limited","code":"429"}}`))
 	}))
+	t.Cleanup(up.Close)
+	cfg := testConfig(up.URL)
+	cfg.UpstreamRetry.Enabled = false
+	s := New(cfg, newTestLogger(), newTestRegistry())
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	t.Cleanup(proxy.Close)
 
 	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader("{}"))
 	if err != nil {
