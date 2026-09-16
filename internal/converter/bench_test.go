@@ -19,10 +19,10 @@ func benchRequest(nTools int) *responses.Request {
 	return &responses.Request{
 		Model: "bench",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "system", Content: responses.ItemContent{String: "sys prompt"}},
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "question"}},
-			{Type: "function_call", CallID: "call_1", Name: "tool_a", Arguments: `{"x":"1"}`},
-			{Type: "function_call_output", CallID: "call_1", Output: responses.OutputContent{String: `{"ok":true}`}},
+			{Type: "message", Role: "system", Content: &responses.ItemContent{String: "sys prompt"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "question"}},
+			{Type: "function_call", CallID: "call_1", Name: "tool_a", Arguments: strPtr(`{"x":"1"}`)},
+			{Type: "function_call_output", CallID: "call_1", Output: &responses.OutputContent{String: `{"ok":true}`}},
 		}},
 		Tools: tools,
 	}

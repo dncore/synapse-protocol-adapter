@@ -71,6 +71,11 @@ func (i *Input) UnmarshalJSON(b []byte) error {
 
 // Item is one entry of the input item list. Items are distinguished by
 // their Type field; only the fields relevant to each type are populated.
+// Content, Summary and Output are pointers so that items of a different
+// type omit the key entirely instead of serializing a zero value: Codex
+// drops the whole output_item.added event unless a message's content and
+// a reasoning item's summary have exactly the shapes it expects (an empty
+// array where the key must be present, no key where it must be absent).
 type Item struct {
 	// Common
 	Type   string `json:"type"` // "message" | "function_call" | "function_call_output" | ...
@@ -78,20 +83,23 @@ type Item struct {
 	Status string `json:"status,omitempty"`
 
 	// message
-	Role    string        `json:"role,omitempty"`
-	Content ItemContent   `json:"content,omitempty"`
+	Role    string       `json:"role,omitempty"`
+	Content *ItemContent `json:"content,omitempty"`
 
 	// reasoning
-	Summary []ContentPart `json:"summary,omitempty"`
+	Summary *[]ContentPart `json:"summary,omitempty"`
 
-	// function_call
-	Name      string `json:"name,omitempty"`
-	CallID    string `json:"call_id,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	// function_call. Arguments is a pointer for the same reason Content is:
+	// a function_call item opening with no arguments yet must still
+	// serialize "arguments":"" — Codex's deserializer requires the key,
+	// and a plain string with omitempty would drop it.
+	Name      string  `json:"name,omitempty"`
+	CallID    string  `json:"call_id,omitempty"`
+	Arguments *string `json:"arguments,omitempty"`
 
 	// function_call_output: a plain string (Codex) or an array of typed
 	// content parts (newer clients). Both are accepted.
-	Output OutputContent
+	Output *OutputContent `json:"output,omitempty"`
 }
 
 // OutputContent is tool output: either a JSON string or content parts.
@@ -206,15 +214,41 @@ type Event struct {
 	SequenceNumber int64     `json:"sequence_number"`
 	Response       *Response `json:"response,omitempty"`
 	Item           *Item     `json:"item,omitempty"`
-	OutputIndex    int       `json:"output_index"`
-	ItemID         string    `json:"item_id,omitempty"`
-	ContentIndex   int       `json:"content_index"`
-	Delta          string    `json:"delta,omitempty"`
-	Text           string    `json:"text,omitempty"`
-	Refusal        string    `json:"refusal,omitempty"`
-	Arguments      string    `json:"arguments,omitempty"`
-	Name           string    `json:"name,omitempty"`
-	CallID         string    `json:"call_id,omitempty"`
+	// Part carries the content part of response.content_part.added/done
+	// (OutputTextPart) and response.reasoning_summary_part.added/done
+	// (SummaryTextPart). The API reference puts the part here; only the
+	// item-bearing events use Item.
+	Part         any    `json:"part,omitempty"`
+	OutputIndex  int    `json:"output_index"`
+	ItemID       string `json:"item_id,omitempty"`
+	ContentIndex int    `json:"content_index"`
+	// SummaryIndex indexes reasoning-summary parts; Codex requires the key
+	// on response.reasoning_summary_* events and drops them without it.
+	// No omitempty, for the same reason content_index has none: the zero
+	// value 0 must serialize as 0 rather than vanish.
+	SummaryIndex int    `json:"summary_index"`
+	Delta        string `json:"delta,omitempty"`
+	Text         string `json:"text,omitempty"`
+	Refusal      string `json:"refusal,omitempty"`
+	Arguments    string `json:"arguments,omitempty"`
+	Name         string `json:"name,omitempty"`
+	CallID       string `json:"call_id,omitempty"`
+}
+
+// OutputTextPart is the `part` payload of response.content_part.added and
+// response.content_part.done. The API reference requires text and
+// annotations to be present even when empty, so neither field is omitted.
+type OutputTextPart struct {
+	Type        string   `json:"type"` // "output_text"
+	Text        string   `json:"text"`
+	Annotations []string `json:"annotations"`
+}
+
+// SummaryTextPart is the `part` payload of
+// response.reasoning_summary_part.added and .done.
+type SummaryTextPart struct {
+	Type string `json:"type"` // "summary_text"
+	Text string `json:"text"`
 }
 
 // ErrItemUnsupported is returned by the converter for input item types it

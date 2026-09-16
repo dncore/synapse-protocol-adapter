@@ -89,6 +89,10 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 				}
 				msgs = append(msgs, *m)
 			case "function_call":
+				arguments := ""
+				if item.Arguments != nil {
+					arguments = *item.Arguments
+				}
 				call := completions.ToolCall{
 					// Some clients put the id only in `id` when replaying
 					// history; accept either key.
@@ -96,7 +100,7 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 					Type: "function",
 					Function: completions.FuncCall{
 						Name:      item.Name,
-						Arguments: item.Arguments,
+						Arguments: arguments,
 					},
 				}
 				// Merge into the previous assistant message when the client
@@ -160,11 +164,15 @@ func convertMessageItem(item *responses.Item) (*completions.Message, error) {
 	}
 
 	m := completions.Message{Role: role}
-	if item.Content.String != "" {
-		m.Content = completions.MessageContent{String: item.Content.String}
+	content := item.Content
+	if content == nil {
+		content = &responses.ItemContent{}
+	}
+	if content.String != "" {
+		m.Content = completions.MessageContent{String: content.String}
 	} else {
-		parts := make([]completions.ContentPart, 0, len(item.Content.Parts))
-		for _, p := range item.Content.Parts {
+		parts := make([]completions.ContentPart, 0, len(content.Parts))
+		for _, p := range content.Parts {
 			switch p.Type {
 			case "input_text", "output_text", "summary_text":
 				parts = append(parts, completions.ContentPart{Type: "text", Text: p.Text})
@@ -191,7 +199,10 @@ func convertMessageItem(item *responses.Item) (*completions.Message, error) {
 // toolOutputContent flattens a tool output (string or typed parts) into a
 // chat tool-message content. String outputs pass through verbatim; part
 // arrays are joined as their text/image-url parts.
-func toolOutputContent(out responses.OutputContent) completions.MessageContent {
+func toolOutputContent(out *responses.OutputContent) completions.MessageContent {
+	if out == nil {
+		return completions.MessageContent{}
+	}
 	if out.Parts == nil {
 		return completions.MessageContent{String: out.String}
 	}
@@ -373,6 +384,14 @@ func convertResponseFormat(req *responses.Request) (json.RawMessage, error) {
 		if len(schema.Schema) == 0 {
 			return nil, errors.New("invalid json_schema in response_format: missing schema")
 		}
+		name := schema.Name
+		if name == "" {
+			// Codex's guardian approval reviewer sends text.format without
+			// a name; chat completions validates name to be non-empty, so
+			// an empty one turns every review into an upstream 400. The
+			// name is cosmetic for enforcement — supply a default.
+			name = "final_output"
+		}
 		type chatSchema struct {
 			Name   string          `json:"name"`
 			Schema json.RawMessage `json:"schema"`
@@ -381,7 +400,7 @@ func convertResponseFormat(req *responses.Request) (json.RawMessage, error) {
 		out, err := json.Marshal(struct {
 			Type       string     `json:"type"`
 			JSONSchema chatSchema `json:"json_schema"`
-		}{"json_schema", chatSchema{Name: schema.Name, Schema: schema.Schema, Strict: schema.Strict}})
+		}{"json_schema", chatSchema{Name: name, Schema: schema.Schema, Strict: schema.Strict}})
 		if err != nil {
 			return nil, err
 		}

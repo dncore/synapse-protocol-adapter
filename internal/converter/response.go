@@ -52,7 +52,7 @@ func ConvertResponse(chat *completions.Response, req *responses.Request) *respon
 			Type:   "reasoning",
 			ID:     "rs_" + chat.ID,
 			Status: "completed",
-			Summary: []responses.ContentPart{{
+			Summary: &[]responses.ContentPart{{
 				Type: "summary_text",
 				Text: rc,
 			}},
@@ -72,7 +72,7 @@ func ConvertResponse(chat *completions.Response, req *responses.Request) *respon
 			ID:      "msg_" + chat.ID,
 			Status:  "completed",
 			Role:    "assistant",
-			Content: responses.ItemContent{Parts: parts},
+			Content: &responses.ItemContent{Parts: parts},
 		})
 	}
 
@@ -82,7 +82,7 @@ func ConvertResponse(chat *completions.Response, req *responses.Request) *respon
 			ID:        "fc_" + chat.ID,
 			CallID:    tc.ID,
 			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
+			Arguments: &tc.Function.Arguments,
 			Status:    "completed",
 		})
 	}

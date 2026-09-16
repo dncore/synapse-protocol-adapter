@@ -124,7 +124,7 @@ func TestStreamer_ParallelToolCalls(t *testing.T) {
 		t.Fatalf("want 2 aggregated tool calls, got %d", len(final.Output))
 	}
 	// Arguments must be accumulated per index, interleaving-safe.
-	if final.Output[0].Arguments != `{"x":1}` || final.Output[1].Arguments != `{"y":2}` {
+	if *final.Output[0].Arguments != `{"x":1}` || *final.Output[1].Arguments != `{"y":2}` {
 		t.Fatalf("argument accumulation wrong: %+v", final.Output)
 	}
 	if final.Output[0].CallID != "call_a" || final.Output[1].CallID != "call_b" {

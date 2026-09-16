@@ -45,8 +45,8 @@ func TestConvertRequest_InstructionsDuplicatedWhenSystemPresent(t *testing.T) {
 		Model:        "m",
 		Instructions: "be terse",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "system", Content: responses.ItemContent{String: "existing"}},
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "hi"}},
+			{Type: "message", Role: "system", Content: &responses.ItemContent{String: "existing"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "hi"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -62,12 +62,12 @@ func TestConvertRequest_RolesAndParts(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "developer", Content: responses.ItemContent{String: "dev rules"}},
-			{Type: "message", Role: "user", Content: responses.ItemContent{Parts: []responses.ContentPart{
+			{Type: "message", Role: "developer", Content: &responses.ItemContent{String: "dev rules"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{Parts: []responses.ContentPart{
 				{Type: "input_text", Text: "look"},
 				{Type: "input_image", ImageURL: "data:image/png;base64,AAA"},
 			}}},
-			{Type: "message", Role: "assistant", Content: responses.ItemContent{String: "sure"}},
+			{Type: "message", Role: "assistant", Content: &responses.ItemContent{String: "sure"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -90,9 +90,9 @@ func TestConvertRequest_ToolLoop(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "weather?"}},
-			{Type: "function_call", CallID: "call_1", Name: "get_weather", Arguments: `{"city":"SF"}`},
-			{Type: "function_call_output", CallID: "call_1", Output: responses.OutputContent{String: `{"temp":21}`}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "weather?"}},
+			{Type: "function_call", CallID: "call_1", Name: "get_weather", Arguments: strPtr(`{"city":"SF"}`)},
+			{Type: "function_call_output", CallID: "call_1", Output: &responses.OutputContent{String: `{"temp":21}`}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -236,6 +236,43 @@ func TestConvertRequest_ResponseFormatJSONSchemaFlatTextFormat(t *testing.T) {
 	}
 }
 
+// Codex's guardian approval reviewer sends a flat text.format without a
+// name. Chat completions validates name to be non-empty, so an empty one
+// turns every review into an upstream 400; the converter must synthesize
+// a default while preserving explicit names.
+func TestConvertRequest_JSONSchemaNameDefault(t *testing.T) {
+	convert := func(format string) string {
+		t.Helper()
+		req := &responses.Request{
+			Model: "m",
+			Input: responses.Input{String: "hi"},
+			Text:  &responses.TextFormat{Format: json.RawMessage(format)},
+		}
+		out, err := ConvertRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rf struct {
+			JSONSchema struct {
+				Name string `json:"name"`
+			} `json:"json_schema"`
+		}
+		if err := json.Unmarshal(out.ResponseFormat, &rf); err != nil {
+			t.Fatal(err)
+		}
+		return rf.JSONSchema.Name
+	}
+
+	got := convert(`{"type":"json_schema","strict":false,"schema":{"type":"object","properties":{"outcome":{"type":"string"}},"required":["outcome"]}}`)
+	if got != "final_output" {
+		t.Fatalf("nameless text.format must get a default name, got %q", got)
+	}
+	got = convert(`{"type":"json_schema","name":"keep","schema":{"type":"object"}}`)
+	if got != "keep" {
+		t.Fatalf("explicit name must be preserved, got %q", got)
+	}
+}
+
 func TestConvertRequest_Errors(t *testing.T) {
 	prev := "resp_1"
 	cases := []struct {
@@ -262,11 +299,11 @@ func TestConvertRequest_LenientHistory(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "hi"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "hi"}},
 			{Type: "custom_tool_call", Name: "patch"},
 			{Type: "local_shell_call"},
-			{Type: "message", Role: "wizard", Content: responses.ItemContent{String: "??"}},
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "there"}},
+			{Type: "message", Role: "wizard", Content: &responses.ItemContent{String: "??"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "there"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -283,7 +320,7 @@ func TestConvertRequest_ReasoningItemDropped(t *testing.T) {
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
 			{Type: "reasoning"},
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "hi"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "hi"}},
 		}},
 	}
 	out, err := ConvertRequest(req)

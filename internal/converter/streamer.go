@@ -140,20 +140,23 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 					OutputIndex: s.reasoningOutIdx,
 					Item: &responses.Item{
 						Type: "reasoning", ID: s.reasoningItemID, Status: "in_progress",
-						Summary: []responses.ContentPart{},
+						// An empty (not omitted, not null) summary is
+						// required: Codex drops the item when the key is
+						// absent and its deserializer rejects null.
+						Summary: &[]responses.ContentPart{},
 					},
 				},
 				&responses.Event{
 					Type: "response.reasoning_summary_part.added", SequenceNumber: s.nextSeq(),
-					ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
-					Item: &responses.Item{Type: "reasoning_summary_part", ID: s.reasoningItemID, Status: "in_progress"},
+					ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, SummaryIndex: 0,
+					Part: responses.SummaryTextPart{Type: "summary_text", Text: ""},
 				},
 			)
 		}
 		s.reasoningBuf = append(s.reasoningBuf, r...)
 		events = append(events, &responses.Event{
 			Type: "response.reasoning_summary_text.delta", SequenceNumber: s.nextSeq(),
-			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, SummaryIndex: 0,
 			Delta: r,
 		})
 	}
@@ -172,12 +175,18 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 			s.textItemID = "msg_" + s.respID
 			s.textOutputIdx = s.outputIndex
 			s.outputIndex++
+			// The message opens with an empty content array — the shape
+			// the API reference ships and Codex parses. A placeholder
+			// part with an empty text is not equivalent: the empty text
+			// key gets omitted and the item then fails Codex's strict
+			// deserialization, which silently drops it and turns every
+			// following output_text.delta into an error.
 			item := &responses.Item{
 				Type:    "message",
 				ID:      s.textItemID,
 				Status:  "in_progress",
 				Role:    "assistant",
-				Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: ""}}},
+				Content: &responses.ItemContent{Parts: []responses.ContentPart{}},
 			}
 			events = append(events,
 				&responses.Event{
@@ -187,11 +196,7 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 				&responses.Event{
 					Type: "response.content_part.added", SequenceNumber: s.nextSeq(),
 					ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0,
-					Item: &responses.Item{
-						Type: "output_text", ID: s.textItemID,
-						Status: "in_progress", Role: "assistant",
-						Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: ""}}},
-					},
+					Part: responses.OutputTextPart{Type: "output_text", Annotations: []string{}},
 				},
 			)
 		}
@@ -225,12 +230,13 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 			st.added = true
 			st.outputIdx = s.outputIndex
 			s.outputIndex++
+			emptyArgs := ""
 			events = append(events, &responses.Event{
 				Type: "response.output_item.added", SequenceNumber: s.nextSeq(),
 				OutputIndex: st.outputIdx,
 				Item: &responses.Item{
 					Type: "function_call", ID: st.itemID, CallID: st.callID,
-					Name: st.name, Arguments: "", Status: "in_progress",
+					Name: st.name, Arguments: &emptyArgs, Status: "in_progress",
 				},
 			})
 		}
@@ -257,7 +263,7 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 				OutputIndex: s.textOutputIdx,
 				Item: &responses.Item{
 					Type: "message", ID: s.textItemID, Status: "in_progress", Role: "assistant",
-					Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "output_text", Text: ""}}},
+					Content: &responses.ItemContent{Parts: []responses.ContentPart{}},
 				},
 			})
 		}
@@ -306,17 +312,14 @@ func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 			&responses.Event{
 				Type: "response.content_part.done", SequenceNumber: s.nextSeq(),
 				ItemID: s.textItemID, OutputIndex: s.textOutputIdx, ContentIndex: 0,
-				Item: &responses.Item{
-					Type: "output_text", ID: s.textItemID, Status: "completed", Role: "assistant",
-					Content: responses.ItemContent{Parts: parts},
-				},
+				Part: responses.OutputTextPart{Type: "output_text", Text: text, Annotations: []string{}},
 			},
 			&responses.Event{
 				Type: "response.output_item.done", SequenceNumber: s.nextSeq(),
 				OutputIndex: s.textOutputIdx,
 				Item: &responses.Item{
 					Type: "message", ID: s.textItemID, Status: "completed", Role: "assistant",
-					Content: responses.ItemContent{Parts: parts},
+					Content: &responses.ItemContent{Parts: parts},
 				},
 			},
 		)
@@ -338,7 +341,7 @@ func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 				OutputIndex: st.outputIdx,
 				Item: &responses.Item{
 					Type: "function_call", ID: st.itemID, CallID: st.callID,
-					Name: st.name, Arguments: st.arguments, Status: "completed",
+					Name: st.name, Arguments: &st.arguments, Status: "completed",
 				},
 			},
 		)
@@ -377,19 +380,19 @@ func (s *Streamer) Finish() []*responses.Event {
 		st := s.tools[idx]
 		resp.Output = append(resp.Output, responses.Item{
 			Type: "function_call", ID: st.itemID, CallID: st.callID,
-			Name: st.name, Arguments: st.arguments, Status: "completed",
+			Name: st.name, Arguments: &st.arguments, Status: "completed",
 		})
 	}
 	if s.textItemOpen || len(s.textBuf) > 0 || len(s.refusalBuf) > 0 {
 		resp.Output = append([]responses.Item{{
 			Type: "message", ID: s.textItemID, Status: "completed", Role: "assistant",
-			Content: responses.ItemContent{Parts: s.textParts()},
+			Content: &responses.ItemContent{Parts: s.textParts()},
 		}}, resp.Output...)
 	}
 	if len(s.reasoningBuf) > 0 {
 		resp.Output = append([]responses.Item{{
 			Type: "reasoning", ID: s.reasoningItemID, Status: "completed",
-			Summary: []responses.ContentPart{{Type: "summary_text", Text: string(s.reasoningBuf)}},
+			Summary: &[]responses.ContentPart{{Type: "summary_text", Text: string(s.reasoningBuf)}},
 		}}, resp.Output...)
 	}
 
@@ -417,22 +420,19 @@ func (s *Streamer) closeReasoning() []*responses.Event {
 	return []*responses.Event{
 		{
 			Type: "response.reasoning_summary_text.done", SequenceNumber: s.nextSeq(),
-			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0, Text: sum,
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, SummaryIndex: 0, Text: sum,
 		},
 		{
 			Type: "response.reasoning_summary_part.done", SequenceNumber: s.nextSeq(),
-			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, ContentIndex: 0,
-			Item: &responses.Item{
-				Type: "reasoning_summary_part", ID: s.reasoningItemID, Status: "completed",
-				Content: responses.ItemContent{Parts: []responses.ContentPart{{Type: "summary_text", Text: sum}}},
-			},
+			ItemID: s.reasoningItemID, OutputIndex: s.reasoningOutIdx, SummaryIndex: 0,
+			Part: responses.SummaryTextPart{Type: "summary_text", Text: sum},
 		},
 		{
 			Type: "response.output_item.done", SequenceNumber: s.nextSeq(),
 			OutputIndex: s.reasoningOutIdx,
 			Item: &responses.Item{
 				Type: "reasoning", ID: s.reasoningItemID, Status: "completed",
-				Summary: []responses.ContentPart{{Type: "summary_text", Text: sum}},
+				Summary: &[]responses.ContentPart{{Type: "summary_text", Text: sum}},
 			},
 		},
 	}

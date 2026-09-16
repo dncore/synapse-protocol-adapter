@@ -88,10 +88,10 @@ func TestConvertRequest_ToolOutputAsParts(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "hi"}},
-			{Type: "function_call", CallID: "c1", Name: "f", Arguments: "{}"},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "hi"}},
+			{Type: "function_call", CallID: "c1", Name: "f", Arguments: strPtr("{}")},
 			{Type: "function_call_output", CallID: "c1",
-				Output: responses.OutputContent{Parts: []responses.ContentPart{
+				Output: &responses.OutputContent{Parts: []responses.ContentPart{
 					{Type: "output_text", Text: "{\"ok\":"},
 					{Type: "output_text", Text: "true}"},
 				}}},
@@ -127,7 +127,7 @@ func TestConvertRequest_PromptFieldFallback(t *testing.T) {
 	req := &responses.Request{
 		Model:  "m",
 		Prompt: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "via prompt"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "via prompt"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -204,7 +204,7 @@ func TestStreamer_ReasoningContentFlow(t *testing.T) {
 		}
 	}
 	final := s.FinalResponse()
-	if final.Output[0].Type != "reasoning" || final.Output[0].Summary[0].Text != "think hard" {
+	if final.Output[0].Type != "reasoning" || (*final.Output[0].Summary)[0].Text != "think hard" {
 		t.Fatalf("reasoning aggregation wrong: %+v", final.Output[0])
 	}
 	if final.Output[1].Type != "message" {
@@ -221,7 +221,7 @@ func TestConvertResponse_ReasoningContent(t *testing.T) {
 		}, FinishReason: "stop"}},
 	}
 	out := ConvertResponse(chat, &responses.Request{})
-	if out.Output[0].Type != "reasoning" || out.Output[0].Summary[0].Text != "because" {
+	if out.Output[0].Type != "reasoning" || (*out.Output[0].Summary)[0].Text != "because" {
 		t.Fatalf("reasoning item wrong: %+v", out.Output[0])
 	}
 	if out.Output[1].Type != "message" || out.Output[1].Content.Parts[0].Text != "ans" {
@@ -274,11 +274,11 @@ func TestConvertRequest_MergesConsecutiveFunctionCalls(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "go"}},
-			{Type: "function_call", CallID: "c1", Name: "a", Arguments: "{}"},
-			{Type: "function_call", CallID: "c2", Name: "b", Arguments: "{}"},
-			{Type: "function_call_output", CallID: "c1", Output: responses.OutputContent{String: "1"}},
-			{Type: "function_call_output", CallID: "c2", Output: responses.OutputContent{String: "2"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "go"}},
+			{Type: "function_call", CallID: "c1", Name: "a", Arguments: strPtr("{}")},
+			{Type: "function_call", CallID: "c2", Name: "b", Arguments: strPtr("{}")},
+			{Type: "function_call_output", CallID: "c1", Output: &responses.OutputContent{String: "1"}},
+			{Type: "function_call_output", CallID: "c2", Output: &responses.OutputContent{String: "2"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
@@ -300,9 +300,9 @@ func TestConvertRequest_CallIDFallsBackToID(t *testing.T) {
 	req := &responses.Request{
 		Model: "m",
 		Input: responses.Input{Items: []responses.Item{
-			{Type: "message", Role: "user", Content: responses.ItemContent{String: "x"}},
-			{Type: "function_call", ID: "fc_123", Name: "f", Arguments: "{}"},
-			{Type: "function_call_output", CallID: "fc_123", Output: responses.OutputContent{String: "ok"}},
+			{Type: "message", Role: "user", Content: &responses.ItemContent{String: "x"}},
+			{Type: "function_call", ID: "fc_123", Name: "f", Arguments: strPtr("{}")},
+			{Type: "function_call_output", CallID: "fc_123", Output: &responses.OutputContent{String: "ok"}},
 		}},
 	}
 	out, err := ConvertRequest(req)
