@@ -353,13 +353,25 @@ func convertResponseFormat(req *responses.Request) (json.RawMessage, error) {
 
 	switch probe.Type {
 	case "json_schema":
+		// Two nestings carry name/schema/strict in the wild: the official
+		// Responses text.format shape flattens them onto the format object
+		// itself (Codex/Guardian structured output sends this), while the
+		// chat completions shape nests them under "json_schema". Accept
+		// both; the nested form wins when both are present.
+		payload := probe.JSONSchema
+		if len(payload) == 0 {
+			payload = raw
+		}
 		var schema struct {
 			Name   string          `json:"name"`
 			Schema json.RawMessage `json:"schema"`
 			Strict *bool           `json:"strict"`
 		}
-		if err := json.Unmarshal(probe.JSONSchema, &schema); err != nil {
+		if err := json.Unmarshal(payload, &schema); err != nil {
 			return nil, fmt.Errorf("invalid json_schema in response_format: %w", err)
+		}
+		if len(schema.Schema) == 0 {
+			return nil, errors.New("invalid json_schema in response_format: missing schema")
 		}
 		type chatSchema struct {
 			Name   string          `json:"name"`

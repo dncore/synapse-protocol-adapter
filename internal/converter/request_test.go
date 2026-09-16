@@ -201,6 +201,41 @@ func TestConvertRequest_ResponseFormatJSONSchema(t *testing.T) {
 	}
 }
 
+// Codex (Guardian auto-review) sends the official Responses text.format
+// shape, which flattens name/schema/strict onto the format object itself
+// instead of nesting them under "json_schema".
+func TestConvertRequest_ResponseFormatJSONSchemaFlatTextFormat(t *testing.T) {
+	req := &responses.Request{
+		Model: "m",
+		Input: responses.Input{String: "hi"},
+		Text: &responses.TextFormat{
+			Format: json.RawMessage(`{"type":"json_schema","name":"codex_output_schema","schema":{"type":"object","properties":{"outcome":{"type":"string"}},"required":["outcome"]},"strict":true}`),
+		},
+	}
+	out, err := ConvertRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rf struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Name   string          `json:"name"`
+			Schema json.RawMessage `json:"schema"`
+			Strict bool            `json:"strict"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(out.ResponseFormat, &rf); err != nil {
+		t.Fatal(err)
+	}
+	if rf.Type != "json_schema" || rf.JSONSchema.Name != "codex_output_schema" || !rf.JSONSchema.Strict {
+		t.Fatalf("flat text.format misconverted: %s", out.ResponseFormat)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(rf.JSONSchema.Schema, &schema); err != nil || schema["type"] != "object" {
+		t.Fatalf("schema lost: %s (%v)", rf.JSONSchema.Schema, err)
+	}
+}
+
 func TestConvertRequest_Errors(t *testing.T) {
 	prev := "resp_1"
 	cases := []struct {
@@ -210,6 +245,7 @@ func TestConvertRequest_Errors(t *testing.T) {
 		{"previous_response_id", &responses.Request{Model: "m", Input: responses.Input{String: "x"}, PreviousResponseID: &prev}},
 		{"empty input", &responses.Request{Model: "m"}},
 		{"only unknown items", &responses.Request{Model: "m", Input: responses.Input{Items: []responses.Item{{Type: "web_search_call"}}}}},
+		{"json_schema without schema", &responses.Request{Model: "m", Input: responses.Input{String: "x"}, Text: &responses.TextFormat{Format: json.RawMessage(`{"type":"json_schema","name":"n"}`)}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
