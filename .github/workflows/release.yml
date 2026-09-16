@@ -77,6 +77,12 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      # Granular publish tokens expire after ≤90 days (and direct-publish
+      # bypass-2FA tokens go away in Jan 2027) — fail with a one-glance
+      # reason instead of an opaque error deep inside the publish loop.
+      - name: Check npm auth (fail fast on stale NPM_TOKEN)
+        if: env.NODE_AUTH_TOKEN != ''
+        run: npm whoami
       - name: Stage platform packages
         run: |
           mkdir -p npm/linux-x64/bin npm/linux-arm64/bin npm/darwin-x64/bin npm/darwin-arm64/bin
@@ -89,12 +95,26 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: node scripts/npm-set-version.js "${REF_NAME#v}"
+      # Publish steps are idempotent: versions already on the registry are
+      # skipped, so re-running a partially failed release resumes cleanly
+      # instead of dying on E409 for versions a previous attempt published.
       - name: Publish platform packages
         if: env.NODE_AUTH_TOKEN != ''
         run: |
           for d in npm/linux-x64 npm/linux-arm64 npm/darwin-x64 npm/darwin-arm64; do
-            (cd "$d" && npm publish --access public)
+            pkg=$(node -p "require('./$d/package.json').name + '@' + require('./$d/package.json').version")
+            if npm view "$pkg" version >/dev/null 2>&1; then
+              echo "$pkg already published — skipping"
+            else
+              (cd "$d" && npm publish --access public)
+            fi
           done
       - name: Publish root package
         if: env.NODE_AUTH_TOKEN != ''
-        run: cd npm && npm publish --access public
+        run: |
+          pkg=$(node -p "require('./npm/package.json').name + '@' + require('./npm/package.json').version")
+          if npm view "$pkg" version >/dev/null 2>&1; then
+            echo "$pkg already published — skipping"
+          else
+            (cd npm && npm publish --access public)
+          fi
