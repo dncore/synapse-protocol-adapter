@@ -149,7 +149,11 @@ func ForwardRequestHeaders(dst http.Header, src http.Header) {
 }
 
 // responseDropped lists upstream response headers the proxy rewrites:
-// hop-by-hop framing plus content framing (the proxy re-serializes bodies).
+// hop-by-hop framing plus Content-Length (the proxy re-frames bodies).
+// Content-Type is deliberately NOT dropped: it is end-to-end metadata,
+// the passthrough route forwards bodies byte for byte and must relay it
+// (strict clients refuse a body with no media type), and the converter
+// routes overwrite it with their own value right after forwarding.
 var responseDropped = map[string]struct{}{
 	"Connection":          {},
 	"Keep-Alive":          {},
@@ -160,7 +164,6 @@ var responseDropped = map[string]struct{}{
 	"Transfer-Encoding":   {},
 	"Upgrade":             {},
 	"Content-Length":      {},
-	"Content-Type":        {},
 }
 
 // ForwardResponseHeaders copies upstream response headers back to the

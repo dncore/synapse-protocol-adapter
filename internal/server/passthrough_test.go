@@ -136,6 +136,39 @@ func TestPassthrough_ErrorVerbatim(t *testing.T) {
 	}
 }
 
+// The passthrough route must relay the upstream's Content-Type: strict
+// clients (Claude Code's auto-mode classifier among them) refuse to treat
+// a 200 with no media type as a live response, while the converter routes
+// set their own type and stay unaffected.
+func TestPassthrough_ContentTypePreserved(t *testing.T) {
+	cases := []struct {
+		name  string
+		ctype string
+		body  string
+	}{
+		{"streaming", "text/event-stream; charset=utf-8", "event: ping\ndata: {}\n\n"},
+		{"non-streaming", "application/json", `{"id":"c1"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, _ := newPassthroughTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.ctype)
+				w.WriteHeader(200)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+
+			resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if got := resp.Header.Get("Content-Type"); got != tc.ctype {
+				t.Fatalf("Content-Type = %q, want %q (upstream value must pass through)", got, tc.ctype)
+			}
+		})
+	}
+}
+
 func TestPassthrough_StreamingPerChunkFlush(t *testing.T) {
 	second := make(chan struct{})
 	firstSeen := make(chan struct{})
