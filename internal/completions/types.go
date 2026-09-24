@@ -15,6 +15,10 @@ type Request struct {
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"top_p,omitempty"`
 	MaxTokens          *int            `json:"max_tokens,omitempty"`
+	// MaxCompletionTokens is the renamed output-cap field newer OpenAI
+	// models require in place of max_tokens (both marshal under the same
+	// omitempty rule; the converter sets exactly one).
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
 	StreamOptions      *StreamOptions  `json:"stream_options,omitempty"`
 	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`

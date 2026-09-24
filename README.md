@@ -271,7 +271,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `developer` role messages | normalized to `system` (semantically identical, universally accepted) |
 | consecutive `function_call` items (parallel calls) | merged into ONE assistant message with N `tool_calls` |
 | `function_call` with only `id`, no `call_id` | `id` used as the tool call id |
-| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it) |
+| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); with `tools` on **gpt-6** it is forced to `"none"` — the shared gateway rejects tools × effort, and an omitted effort counts as non-none |
 | tool `parameters` without top-level `type` | `{"type":"object"}` injected (several providers require it) |
 | `input[]` `message` items | messages (`system`/`developer`/`user`/`assistant` roles pass through) |
 | `input_text` / `output_text` / `summary_text` parts | `{type:"text"}` parts |
@@ -282,7 +282,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `reasoning` items | dropped (no chat equivalent) |
 | `tools[]` (flattened) | `tools[]` (nested `function` object) |
 | `tool_choice` (`"auto"`/`"none"`/`"required"` or object form) | normalized; Cursor-style `{"type":"none"}` etc. map to their string forms, `{"type":"tool"}` → `"required"`, `{"type":"function","name"}` re-nested |
-| `max_output_tokens` | `max_tokens` |
+| `max_output_tokens` | `max_tokens` (**gpt-6**: `max_completion_tokens` — the only name that model accepts) |
 | `temperature`, `top_p`, `parallel_tool_calls`, `user` | same names |
 | `response_format` / `text.format` (`json_schema`/`json_object`/`text`) | `response_format` |
 | `stream: true` | `stream: true` + `stream_options:{include_usage:true}` |

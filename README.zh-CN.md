@@ -251,7 +251,7 @@ metrics 这些 socat 没有的能力。
 | `developer` 角色消息 | 归一为 `system`（语义等价，普遍被接受） |
 | 连续 `function_call` item（并行调用） | 合并为一条带 N 个 `tool_calls` 的 assistant 消息 |
 | 只有 `id` 没有 `call_id` 的 `function_call` | 用 `id` 作为 tool call id |
-| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略） |
+| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 时强制 `"none"` —— 共享网关拒绝 tools × effort 组合，且省略 effort 按非 none 处理 |
 | 顶层缺 `type` 的工具 `parameters` | 注入 `{"type":"object"}`（部分 provider 强制要求） |
 | `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
 | `input_text` / `output_text` / `summary_text` part | `{type:"text"}` part |
@@ -262,7 +262,7 @@ metrics 这些 socat 没有的能力。
 | `reasoning` item | 丢弃（chat 侧无对应） |
 | `tools[]`（扁平结构） | `tools[]`（嵌套 `function` 对象） |
 | `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 归一化；Cursor 风格 `{"type":"none"}` 映射为字符串形式，`{"type":"tool"}` → `"required"`，`{"type":"function","name"}` 重新嵌套 |
-| `max_output_tokens` | `max_tokens` |
+| `max_output_tokens` | `max_tokens`（**gpt-6** 用 `max_completion_tokens` —— 该模型只认这个字段名） |
 | `temperature`、`top_p`、`parallel_tool_calls`、`user` | 同名 |
 | `response_format` / `text.format`（`json_schema`/`json_object`/`text`） | `response_format` |
 | `stream: true` | `stream: true` + `stream_options:{include_usage:true}` |

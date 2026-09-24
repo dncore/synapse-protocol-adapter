@@ -8,10 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/dncore/synapse-protocol-adapter/internal/completions"
 	"github.com/dncore/synapse-protocol-adapter/internal/responses"
 )
+
+// isGPT6 reports whether the model id names a gpt-6-family model
+// (case-insensitive substring, so dated and aliased ids match).
+func isGPT6(model string) bool {
+	return strings.Contains(strings.ToLower(model), "gpt-6")
+}
 
 // ConvertRequest translates a Responses API request into a Chat Completions
 // request. It returns an error suitable for surfacing to the client as 400
@@ -34,16 +41,34 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 		ToolChoice:        convertToolChoice(req.ToolChoice),
 		Temperature:       req.Temperature,
 		TopP:               req.TopP,
-		MaxTokens:          req.MaxOutputTokens,
 		Stream:             req.Stream,
 		ParallelToolCalls:  req.ParallelToolCalls,
 		User:               req.User,
+	}
+	// max_output_tokens maps to chat's max_tokens, except on models whose
+	// API renamed the field: gpt-6 rejects max_tokens with a 400 ("Use
+	// 'max_completion_tokens' instead"), the gpt-5.6 family accepts both.
+	if req.MaxOutputTokens != nil {
+		if isGPT6(req.Model) {
+			out.MaxCompletionTokens = req.MaxOutputTokens
+		} else {
+			out.MaxTokens = req.MaxOutputTokens
+		}
 	}
 	// Responses reasoning effort has a direct chat equivalent on providers
 	// that support it (OpenAI reasoning_effort, Gemini thinking budget
 	// bridges); providers without it ignore unknown fields.
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		out.ReasoningEffort = req.Reasoning.Effort
+	}
+	// gpt-6 on the shared gateway's chat route treats function tools and
+	// reasoning_effort as mutually exclusive, and an omitted effort counts
+	// as non-none — so with tools the only accepted shape is an explicit
+	// "none" (omitting it 400s just like "high"). Codex always sends tools,
+	// which is why every gpt-6 tool turn failed. Cost: no thinking on tool
+	// turns; that is the upstream's limitation, not a choice made here.
+	if len(out.Tools) > 0 && isGPT6(req.Model) {
+		out.ReasoningEffort = "none"
 	}
 	if req.Stream {
 		out.StreamOptions = &completions.StreamOptions{IncludeUsage: true}

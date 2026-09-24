@@ -175,6 +175,72 @@ func TestConvertRequest_ParametersPassthrough(t *testing.T) {
 	}
 }
 
+// gpt-6 on the shared gateway's chat route makes function tools and
+// reasoning_effort mutually exclusive and treats an omitted effort as
+// non-none, so a tools request must carry an explicit "none". Codex sends
+// tools on every turn — without the override each gpt-6 turn 400s.
+func TestConvertRequest_GPT6ToolsForceReasoningNone(t *testing.T) {
+	tool := []responses.Tool{{Type: "function", Name: "get_time"}}
+	mk := func(model, effort string, withTools bool) *completions.Request {
+		req := &responses.Request{Model: model, Input: responses.Input{String: "hi"}}
+		if withTools {
+			req.Tools = tool
+		}
+		if effort != "" {
+			req.Reasoning = &responses.Reasoning{Effort: effort}
+		}
+		out, err := ConvertRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := mk("gpt-6-luna", "high", true); got.ReasoningEffort != "none" {
+		t.Fatalf("gpt-6 with tools must force reasoning_effort=none, got %q", got.ReasoningEffort)
+	}
+	if got := mk("gpt-6-luna", "", true); got.ReasoningEffort != "none" {
+		t.Fatalf("gpt-6 with tools and no effort must still send none, got %q", got.ReasoningEffort)
+	}
+	// Without tools the model reasons normally; the exclusion is tools-only.
+	if got := mk("gpt-6-luna", "high", false); got.ReasoningEffort != "high" {
+		t.Fatalf("gpt-6 without tools must keep the requested effort, got %q", got.ReasoningEffort)
+	}
+	// The rule must not leak onto sibling families that accept both.
+	if got := mk("gpt-5.6-luna", "high", true); got.ReasoningEffort != "high" {
+		t.Fatalf("gpt-5.6 with tools must keep the requested effort, got %q", got.ReasoningEffort)
+	}
+}
+
+// gpt-6 rejects `max_tokens` outright ("Use 'max_completion_tokens'
+// instead"); other models keep the classic field name.
+func TestConvertRequest_MaxTokensFieldByModel(t *testing.T) {
+	maxTok := 1000
+	mk := func(model string) map[string]json.RawMessage {
+		req := &responses.Request{Model: model, Input: responses.Input{String: "hi"}, MaxOutputTokens: &maxTok}
+		out, err := ConvertRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	gpt6 := mk("gpt-6-luna")
+	if string(gpt6["max_completion_tokens"]) != "1000" || gpt6["max_tokens"] != nil {
+		t.Fatalf("gpt-6 must send max_completion_tokens only, got %v", gpt6)
+	}
+	other := mk("kimi-k2.8")
+	if string(other["max_tokens"]) != "1000" || other["max_completion_tokens"] != nil {
+		t.Fatalf("non-gpt-6 must keep max_tokens only, got %v", other)
+	}
+}
+
 func TestConvertRequest_ResponseFormatJSONSchema(t *testing.T) {
 	req := &responses.Request{
 		Model:           "m",
