@@ -32,6 +32,8 @@ type Registry struct {
 	RetriesAbsorbedTotal     *Counter
 	RetryExhaustedTotal      *Counter
 	PassthroughRewritesTotal *LabeledCounter
+	AnthropicTakeoverTotal   *Counter
+	AnthropicFallbackTotal   *LabeledCounter
 
 	// Gauges.
 	ActiveConnections *Gauge
@@ -65,6 +67,8 @@ func NewRegistry() *Registry {
 		RetriesAbsorbedTotal:     &Counter{Name: "protocol_proxy_429_absorbed_total", Help: "Upstream 429s absorbed by a retry (each retry issued)."},
 		RetryExhaustedTotal:      &Counter{Name: "protocol_proxy_429_exhausted_total", Help: "Requests that gave up waiting after their retry budget was exhausted."},
 		PassthroughRewritesTotal: &LabeledCounter{Name: "protocol_proxy_passthrough_rewrites_total", Help: "Passthrough request bodies rewritten by the model-quirk normalizer, by rule.", Label: "rule"},
+		AnthropicTakeoverTotal:   &Counter{Name: "protocol_proxy_anthropic_takeover_total", Help: "Anthropic-mount requests elected for local translation (upstream.anthropic_mode=gpt6-tools); see the fallback counter for candidates that were handed back."},
+		AnthropicFallbackTotal:   &LabeledCounter{Name: "protocol_proxy_anthropic_fallback_total", Help: "Anthropic-mount takeover candidates handed back to passthrough, by reason.", Label: "reason"},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -191,6 +195,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeCounter(r.QueuedRequestsTotal, "")
 	writeCounter(r.RetriesAbsorbedTotal, "")
 	writeCounter(r.RetryExhaustedTotal, "")
+	writeCounter(r.AnthropicTakeoverTotal, "")
 
 	writeLabeled := func(lc *LabeledCounter) {
 		fmt.Fprintf(sb, "# HELP %s %s\n# TYPE %s counter\n", lc.Name, lc.Help, lc.Name)
@@ -213,6 +218,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeLabeled(r.UpstreamErrorsTotal)
 	writeLabeled(r.QueueRejectedTotal)
 	writeLabeled(r.PassthroughRewritesTotal)
+	writeLabeled(r.AnthropicFallbackTotal)
 	writeLabeled(r.Upstream429Total)
 
 	writeGauge := func(g *Gauge) {

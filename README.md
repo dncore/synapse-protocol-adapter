@@ -266,6 +266,23 @@ chat-completions base (`/api/v1/*`), not under it. Point
 proxy and `/v1/messages` lands at the gateway's
 `/api/anthropic/v1/messages` (same for Claude Code).
 
+With `upstream.anthropic_mode: gpt6-tools` the proxy additionally takes over
+**one** shape on that mount: a `gpt-6`-family model on a tool-bearing turn.
+The upstream's own Anthropic translator cannot serve those — it forwards the
+protocol's mandatory `max_tokens` and any `thinking` field into the chat
+request and never sends `reasoning_effort`, which the model rejects with
+`Function tools with reasoning_effort are not supported…`. For those requests
+(and only those) the proxy translates Anthropic ⇄ Chat itself: `system`
+blocks become a system message, text/image/tool_use/tool_result blocks become
+chat content and `tool_calls`, `tools[].input_schema` becomes nested function
+parameters, the family dialect applies (`max_completion_tokens`,
+`reasoning_effort:"none"`), and the answer is re-emitted as Anthropic content
+blocks and SSE events (tool arguments as `input_json_delta`).
+Everything else — other models, tool-free turns, `count_tokens`, other
+endpoints — keeps going through the upstream untouched, and a body shape the
+mapper does not fully understand falls back to plain passthrough rather than
+being translated lossily.
+
 Scope note: this is a scoped reverse proxy for the **single configured
 upstream**, not an open proxy — `/v1/*` reaches that provider and nothing
 else. Only HTTP is forwarded (no WebSocket upgrades).
@@ -386,6 +403,7 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | Per-wait cap (also clamps `Retry-After`) |
 | `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | Total time spent waiting between attempts; beyond it the last 429 goes to the client |
 | `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | Largest passthrough body buffered for replay; larger or length-less bodies stream and are not retried |
+| `upstream.anthropic_mode` | `passthrough` | `PROXY_UPSTREAM_ANTHROPIC_MODE` | `passthrough` forwards the Anthropic mount to the upstream; `gpt6-tools` additionally translates the requests the upstream translator cannot serve (gpt-6 + tools) locally, falling back for anything else |
 | `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | Rewrite request bodies on the transparent routes for the model families whose API renamed or refuses a field the client sends (currently `gpt-6`); off means the routes never touch the client's bytes |
 | `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | Largest body `model_quirks` will rewrite; larger requests are forwarded unchanged |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |
@@ -900,6 +918,8 @@ Metrics (all low-cardinality; never any header, credential, or prompt data):
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream failures |
 | `protocol_proxy_streaming_requests_total` | counter | SSE streams started |
 | `protocol_proxy_passthrough_requests_total` | counter | requests transparently forwarded (no conversion) |
+| `protocol_proxy_anthropic_takeover_total` | counter | Anthropic-mount requests elected for local translation (`upstream.anthropic_mode=gpt6-tools`) |
+| `protocol_proxy_anthropic_fallback_total` | counter | takeover candidates handed back to passthrough, by reason |
 | `protocol_proxy_passthrough_rewrites_total` | counter | passthrough bodies rewritten by `model_quirks`, labeled by rule (`max_tokens`, `reasoning_effort`, `sampling`, `thinking`) |
 | `protocol_proxy_tool_calls_total` | counter | tool calls observed in output |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | body bytes in/out |

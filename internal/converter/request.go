@@ -47,15 +47,10 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 		ParallelToolCalls:  req.ParallelToolCalls,
 		User:               req.User,
 	}
-	// max_output_tokens maps to chat's max_tokens, except on models whose
-	// API renamed the field: gpt-6 rejects max_tokens with a 400 ("Use
-	// 'max_completion_tokens' instead"), the gpt-5.6 family accepts both.
+	// max_output_tokens maps to chat's max_tokens; the family dialect below
+	// renames it for models whose API renamed the field.
 	if req.MaxOutputTokens != nil {
-		if IsGPT6(req.Model) {
-			out.MaxCompletionTokens = req.MaxOutputTokens
-		} else {
-			out.MaxTokens = req.MaxOutputTokens
-		}
+		out.MaxTokens = req.MaxOutputTokens
 	}
 	// Responses reasoning effort has a direct chat equivalent on providers
 	// that support it (OpenAI reasoning_effort, Gemini thinking budget
@@ -63,27 +58,7 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		out.ReasoningEffort = req.Reasoning.Effort
 	}
-	// gpt-6 on the shared gateway's chat route treats function tools and
-	// reasoning_effort as mutually exclusive, and an omitted effort counts
-	// as non-none — so with tools the only accepted shape is an explicit
-	// "none" (omitting it 400s just like "high"). Codex always sends tools,
-	// which is why every gpt-6 tool turn failed. Cost: no thinking on tool
-	// turns; that is the upstream's limitation, not a choice made here.
-	if len(out.Tools) > 0 && IsGPT6(req.Model) {
-		out.ReasoningEffort = "none"
-	}
-	// gpt-6 refuses temperature/top_p while reasoning is ON ("does not
-	// support 0.7 with this model. Only the default (1) value is
-	// supported"), but accepts them once the effort is "none" — measured
-	// against the gateway. The effort sent is the one decided above: tools
-	// force "none", an explicit "none" passes through, anything else (or an
-	// omitted effort, which the upstream reads as non-none) keeps reasoning
-	// on. Dropping the sampling params there is the only way the request
-	// survives; leaving them would 400 the whole turn.
-	if IsGPT6(req.Model) && out.ReasoningEffort != "none" {
-		out.Temperature = nil
-		out.TopP = nil
-	}
+	ApplyChatDialect(req.Model, out)
 	if req.Stream {
 		out.StreamOptions = &completions.StreamOptions{IncludeUsage: true}
 	}
@@ -93,6 +68,36 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 		out.ResponseFormat = rf
 	}
 	return out, nil
+}
+
+// ApplyChatDialect applies the per-model-family chat request rules that every
+// conversion route must honor (Responses→Chat and Anthropic→Chat alike).
+// Rules are measured facts about the shared gateway, dated in the comments;
+// see the README's "Model-family constraints" for the evidence.
+//
+//	gpt-6: max_tokens → max_completion_tokens   (only the latter is accepted)
+//	       tools present → reasoning_effort "none" (tools × effort is rejected,
+//	       and an omitted effort counts as non-none — omitting 400s like "high")
+//	       reasoning on → temperature/top_p dropped (refused in that mode,
+//	       accepted once the effort is "none")
+//
+// Call it after the request is assembled: it only moves/removes fields the
+// caller set, never invents one.
+func ApplyChatDialect(model string, out *completions.Request) {
+	if !IsGPT6(model) {
+		return
+	}
+	if out.MaxTokens != nil && out.MaxCompletionTokens == nil {
+		out.MaxCompletionTokens = out.MaxTokens
+		out.MaxTokens = nil
+	}
+	if len(out.Tools) > 0 {
+		out.ReasoningEffort = "none"
+	}
+	if out.ReasoningEffort != "none" {
+		out.Temperature = nil
+		out.TopP = nil
+	}
 }
 
 // convertMessages builds the chat message list from instructions + input.

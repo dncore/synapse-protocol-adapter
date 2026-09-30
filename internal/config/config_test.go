@@ -416,3 +416,21 @@ func TestPassthroughDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("zero max_rewrite_bytes must be rejected, got %v", err)
 	}
 }
+
+func TestAnthropicModeDefaultsAndValidation(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Upstream.AnthropicMode != AnthropicModePassthrough {
+		t.Fatalf("upstream.anthropic_mode must default to passthrough, got %q", cfg.Upstream.AnthropicMode)
+	}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+	cfg.Upstream.AnthropicMode = AnthropicModeGPT6Tools
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("gpt6-tools must validate: %v", err)
+	}
+	cfg.Upstream.AnthropicMode = "convert"
+	if err := Validate(&cfg); err == nil || !strings.Contains(err.Error(), "anthropic_mode") {
+		t.Fatalf("unknown mode must be rejected, got %v", err)
+	}
+}

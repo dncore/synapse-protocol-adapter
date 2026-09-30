@@ -106,7 +106,28 @@ type Upstream struct {
 	// API well; the proxy then adds only transport value (pooling,
 	// cancellation, one endpoint) with zero semantic translation.
 	ResponsesMode string `yaml:"responses_mode"`
+	// AnthropicMode selects how POST /api/anthropic/v1/messages is served:
+	//   passthrough (default) forward to the upstream's own Anthropic mount
+	//   gpt6-tools            same, except requests that the upstream's
+	//                         translator cannot serve — a gpt-6-family model
+	//                         on a tool-bearing turn, where the translated
+	//                         chat request carries max_tokens/thinking and no
+	//                         reasoning_effort — are translated locally
+	//                         (Anthropic ⇄ Chat) and sent to the chat route
+	//                         with the family dialect applied.
+	// The takeover falls back to passthrough for any body shape it does not
+	// fully understand, so only the broken case changes behavior.
+	AnthropicMode string `yaml:"anthropic_mode"`
 }
+
+// Anthropic mount modes.
+const (
+	// AnthropicModePassthrough forwards everything to the upstream's mount.
+	AnthropicModePassthrough = "passthrough"
+	// AnthropicModeGPT6Tools takes over the requests the upstream translator
+	// cannot serve (see Upstream.AnthropicMode).
+	AnthropicModeGPT6Tools = "gpt6-tools"
+)
 
 // URL returns the absolute completions endpoint.
 func (u Upstream) URL() string {
@@ -218,7 +239,7 @@ type Log struct {
 func Defaults() Config {
 	return Config{
 		Server:   Server{Listen: "0.0.0.0:8787"},
-		Upstream: Upstream{BaseURL: "http://127.0.0.1:8000/v1", ResponsesMode: "convert"},
+		Upstream: Upstream{BaseURL: "http://127.0.0.1:8000/v1", ResponsesMode: "convert", AnthropicMode: AnthropicModePassthrough},
 		Limits: Limits{
 			MaxConcurrency: 200,
 			MaxBodyBytes:   64 << 20, // 64 MiB: conversation histories can be large
@@ -401,6 +422,9 @@ func applyEnv(cfg *Config) {
 			cfg.UpstreamRetry.BufferMaxBytes = n
 		}
 	}
+	if v := os.Getenv("PROXY_UPSTREAM_ANTHROPIC_MODE"); v != "" {
+		cfg.Upstream.AnthropicMode = v
+	}
 	if v := os.Getenv("PROXY_PASSTHROUGH_MODEL_QUIRKS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.Passthrough.ModelQuirks = b
@@ -474,6 +498,15 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.Upstream.ResponsesMode == "" {
 		cfg.Upstream.ResponsesMode = "convert"
+	}
+	if cfg.Upstream.AnthropicMode == "" {
+		cfg.Upstream.AnthropicMode = AnthropicModePassthrough
+	}
+	switch cfg.Upstream.AnthropicMode {
+	case AnthropicModePassthrough, AnthropicModeGPT6Tools:
+	default:
+		errs = append(errs, fmt.Errorf("upstream.anthropic_mode must be %q or %q, got %q",
+			AnthropicModePassthrough, AnthropicModeGPT6Tools, cfg.Upstream.AnthropicMode))
 	}
 	switch cfg.Upstream.ResponsesMode {
 	case "convert", "passthrough":

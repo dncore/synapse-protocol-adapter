@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
@@ -64,6 +65,19 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 				s.metrics.PassthroughRewritesTotal.With(rule).Inc()
 			}
 			buffered = rewritten
+		}
+	}
+
+	// Anthropic-mount takeover: only the requests the upstream's own
+	// translator cannot serve are translated locally (see anthropic.go). A
+	// candidate that turns out unsupported falls back to the passthrough
+	// path below, so the client sees the upstream's answer as before.
+	if buffered != nil {
+		if areq := s.anthropicTakeover(r.URL.Path, buffered); areq != nil {
+			s.metrics.AnthropicTakeoverTotal.Inc()
+			if s.handleAnthropicTakeover(w, r, areq, start) {
+				return
+			}
 		}
 	}
 
@@ -176,6 +190,11 @@ func (s *Server) bufferRequestBody(r *http.Request) ([]byte, error) {
 	if s.cfg.Passthrough.ModelQuirks && rewriteEligible(r) && s.cfg.Passthrough.MaxRewriteBytes > limit {
 		limit = s.cfg.Passthrough.MaxRewriteBytes
 	}
+	// The Anthropic takeover needs the decoded body to decide, so eligible
+	// requests are buffered up to the same ceiling the converted route uses.
+	if s.anthropicTakeoverEligible(r) && int64(s.cfg.Limits.MaxBodyBytes) > limit {
+		limit = int64(s.cfg.Limits.MaxBodyBytes)
+	}
 	if limit == 0 || r.Body == nil || r.ContentLength < 0 || r.ContentLength > limit {
 		return nil, nil
 	}
@@ -185,6 +204,15 @@ func (s *Server) bufferRequestBody(r *http.Request) ([]byte, error) {
 	}
 	s.metrics.BytesInTotal.Add(r.ContentLength)
 	return buf, nil
+}
+
+// anthropicTakeoverEligible reports whether the request could be served by
+// the Anthropic-mount takeover, i.e. whether its body must be buffered for the
+// election to happen at all. The model/tools decision needs the decoded body
+// (anthropicTakeover).
+func (s *Server) anthropicTakeoverEligible(r *http.Request) bool {
+	return s.cfg.Upstream.AnthropicMode == config.AnthropicModeGPT6Tools &&
+		r.Method == http.MethodPost && isAnthropicMessagesPath(r.URL.Path)
 }
 
 // rewriteEligible reports whether the model-quirk rewriter could ever apply

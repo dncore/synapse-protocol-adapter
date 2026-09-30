@@ -42,6 +42,18 @@ upstream:
   # Appended to base_url. Default: /chat/completions
   # Set to /completions only for legacy non-chat providers (no tools).
   path: "/chat/completions"
+  # How the Anthropic mount (/api/anthropic/*) is served:
+  #   passthrough (default) forward to the upstream's own Anthropic endpoint
+  #   gpt6-tools            same, except the requests that upstream translator
+  #                         cannot serve — a gpt-6-family model on a
+  #                         tool-bearing turn, where it forwards max_tokens and
+  #                         thinking and never sends reasoning_effort, which the
+  #                         model rejects. Those are translated locally
+  #                         (Anthropic ⇄ Chat) onto the chat route with the
+  #                         family dialect applied. Anything the local mapper
+  #                         does not fully understand falls back to
+  #                         passthrough, so only the broken case changes.
+  anthropic_mode: passthrough
 
 limits:
   # Max in-flight proxy requests; further requests queue (backpressure).

@@ -244,6 +244,19 @@ metrics 这些 socat 没有的能力。
 `/v1/messages` 就会落到网关的 `/api/anthropic/v1/messages`（Claude Code
 同理）。
 
+开 `upstream.anthropic_mode: gpt6-tools` 后，代理会在这条挂载上额外接管
+**一种**形状：`gpt-6` 族模型 + 带工具的回合。上游自己的 Anthropic 翻译器
+服务不了它们——它会把协议必填的 `max_tokens` 和 `thinking` 原样塞进 chat
+请求、且从不发 `reasoning_effort`，模型直接拒收（`Function tools with
+reasoning_effort are not supported…`）。只有这类请求由代理自己翻译
+（Anthropic ⇄ Chat）：`system` 块 → system 消息，text/image/tool_use/
+tool_result 块 → chat 内容与 `tool_calls`，`tools[].input_schema` → 嵌套
+function 参数，并按模型族方言发 `max_completion_tokens` +
+`reasoning_effort:"none"`；回程把 chat 结果还原成 Anthropic 内容块与 SSE
+事件（工具参数走 `input_json_delta`）。其余一切——其它模型、不带工具的
+回合、`count_tokens`、其它端点——仍原样走上游；映射器不完全认识的请求体
+**回退成透传**，不做有损翻译。
+
 范围说明：这是对**单一已配置 upstream** 的限定反向代理，不是开放代
 理——`/v1/*` 只能到达该 provider，到不了任何其他主机。仅转发 HTTP
 （不支持 WebSocket 升级）。
@@ -363,6 +376,7 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | 单次退避上限（同时约束 `Retry-After`） |
 | `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | 重试等待总预算；超出即把最后一个 429 交给客户端 |
 | `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | passthrough 可重放缓冲上限；更大的或长度未知的请求体流式直通、不重试 |
+| `upstream.anthropic_mode` | `passthrough` | `PROXY_UPSTREAM_ANTHROPIC_MODE` | `passthrough` 把 Anthropic 挂载原样转发给上游；`gpt6-tools` 额外把上游翻译器服务不了的请求（gpt-6 + 工具）在本地翻译，其余回退透传 |
 | `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | 在透明路由上改写「模型族自身 API 改名/拒收字段」的请求体（目前是 `gpt-6`）；关闭时这些路由绝不改动客户端字节 |
 | `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | `model_quirks` 会改写的请求体上限；更大的请求原样转发 |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
@@ -842,6 +856,8 @@ curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream 失败 |
 | `protocol_proxy_streaming_requests_total` | counter | 开始的 SSE 流 |
 | `protocol_proxy_passthrough_requests_total` | counter | 透明转发的请求（无转换） |
+| `protocol_proxy_anthropic_takeover_total` | counter | 被选中做本地翻译的 Anthropic 挂载请求（`upstream.anthropic_mode=gpt6-tools`） |
+| `protocol_proxy_anthropic_fallback_total` | counter | 回退成透传的接管候选请求，按原因打标签 |
 | `protocol_proxy_passthrough_rewrites_total` | counter | 被 `model_quirks` 改写的透传请求体，按规则打标签（`max_tokens`、`reasoning_effort`、`sampling`、`thinking`） |
 | `protocol_proxy_tool_calls_total` | counter | 输出中观察到的 tool call |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | 出入 body 字节 |
