@@ -241,6 +241,57 @@ func TestConvertRequest_MaxTokensFieldByModel(t *testing.T) {
 	}
 }
 
+// gpt-6 refuses temperature/top_p while reasoning is ON, and accepts them
+// once the effort is "none" — so the converter keeps them in the shapes that
+// turn reasoning off (tools present, or an explicit "none") and drops them
+// everywhere else. Measured against the gateway on 2026-09-30.
+func TestConvertRequest_GPT6SamplingParams(t *testing.T) {
+	temp, topP := 0.7, 0.9
+	tool := []responses.Tool{{Type: "function", Name: "get_time"}}
+	tests := []struct {
+		name        string
+		model       string
+		effort      string
+		withTools   bool
+		wantDropped bool
+	}{
+		{name: "reasoning on via explicit effort", model: "gpt-6-luna", effort: "high", wantDropped: true},
+		{name: "reasoning on by default when effort is omitted", model: "gpt-6-luna", wantDropped: true},
+		{name: "tools force none, sampling survives", model: "gpt-6-luna", effort: "high", withTools: true},
+		{name: "explicit none without tools keeps sampling", model: "gpt-6-luna", effort: "none"},
+		{name: "other families keep sampling untouched", model: "glm-5.3", effort: "high"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &responses.Request{
+				Model:       tc.model,
+				Input:       responses.Input{String: "hi"},
+				Temperature: &temp,
+				TopP:        &topP,
+			}
+			if tc.effort != "" {
+				req.Reasoning = &responses.Reasoning{Effort: tc.effort}
+			}
+			if tc.withTools {
+				req.Tools = tool
+			}
+			out, err := ConvertRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantDropped {
+				if out.Temperature != nil || out.TopP != nil {
+					t.Fatalf("sampling params must be dropped while reasoning is on, got temp=%v top_p=%v", out.Temperature, out.TopP)
+				}
+				return
+			}
+			if out.Temperature == nil || out.TopP == nil {
+				t.Fatalf("sampling params must survive, got temp=%v top_p=%v", out.Temperature, out.TopP)
+			}
+		})
+	}
+}
+
 func TestConvertRequest_ResponseFormatJSONSchema(t *testing.T) {
 	req := &responses.Request{
 		Model:           "m",

@@ -222,6 +222,14 @@ provider 复测同样指标。
 body **从不解析、从不缓冲**，响应——包括错误状态码与错误体——逐字节
 流式回传，每读必 flush。
 
+唯一的例外是显式开关 `passthrough.model_quirks`：开启后，模型族自身
+API 改名或拒收某字段的请求体会在被转发前改写——目前只有 `gpt-6` 族
+（`max_tokens` → `max_completion_tokens`；带 `tools` 时注入
+`reasoning_effort:"none"`；推理开启时去掉 `temperature`/`top_p`；
+Anthropic 挂载上还会去掉 `thinking` 并改名 `max_tokens`）。其余任何
+请求体（包括其它所有模型）依旧逐字节透传；超过
+`passthrough.max_rewrite_bytes` 的请求体也不改写、原样转发。
+
 一个端口同时说两种协议：Responses 客户端走 `/v1/responses`（转换），
 原生 chat-completions 客户端走 `/v1/chat/completions`（原样转发），
 Codex 的模型选择器也能从 `/v1/models` 拿到真实结果。它可以取代本地
@@ -252,6 +260,7 @@ metrics 这些 socat 没有的能力。
 | 连续 `function_call` item（并行调用） | 合并为一条带 N 个 `tool_calls` 的 assistant 消息 |
 | 只有 `id` 没有 `call_id` 的 `function_call` | 用 `id` 作为 tool call id |
 | `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 时强制 `"none"` —— 共享网关拒绝 tools × effort 组合，且省略 effort 按非 none 处理 |
+| `temperature`、`top_p` | 同名——但 **gpt-6** 在推理开启时会被丢弃（该模型对非默认值一律 400），在关掉推理的两种形状里保留（带 `tools`，或显式 `reasoning_effort:"none"`） |
 | 顶层缺 `type` 的工具 `parameters` | 注入 `{"type":"object"}`（部分 provider 强制要求） |
 | `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
 | `input_text` / `output_text` / `summary_text` part | `{type:"text"}` part |
@@ -354,6 +363,8 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | 单次退避上限（同时约束 `Retry-After`） |
 | `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | 重试等待总预算；超出即把最后一个 429 交给客户端 |
 | `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | passthrough 可重放缓冲上限；更大的或长度未知的请求体流式直通、不重试 |
+| `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | 在透明路由上改写「模型族自身 API 改名/拒收字段」的请求体（目前是 `gpt-6`）；关闭时这些路由绝不改动客户端字节 |
+| `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | `model_quirks` 会改写的请求体上限；更大的请求原样转发 |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | 单请求总时长上限（长生成） |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | keep-alive 空闲连接超时 |
@@ -831,6 +842,7 @@ curl http://127.0.0.1:8787/metrics  # Prometheus 文本格式
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream 失败 |
 | `protocol_proxy_streaming_requests_total` | counter | 开始的 SSE 流 |
 | `protocol_proxy_passthrough_requests_total` | counter | 透明转发的请求（无转换） |
+| `protocol_proxy_passthrough_rewrites_total` | counter | 被 `model_quirks` 改写的透传请求体，按规则打标签（`max_tokens`、`reasoning_effort`、`sampling`、`thinking`） |
 | `protocol_proxy_tool_calls_total` | counter | 输出中观察到的 tool call |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | 出入 body 字节 |
 | `protocol_proxy_upstream_requests_total` | counter | 发起的 upstream 调用 |

@@ -95,6 +95,28 @@ upstream_retry:
                             # buffered so they can be replayed on retry;
                             # larger or chunked bodies stream (no retry)
 
+passthrough:
+  # The transparent routes (/v1/*, /api/v1/*, /api/anthropic/*) forward
+  # request bodies byte for byte. These switches are the deliberate
+  # exceptions, for bodies the configured upstream rejects as sent.
+  #
+  # model_quirks rewrites the body for the model families whose API renamed
+  # or refuses a field the client sends — currently the gpt-6 family, where
+  # the shared gateway:
+  #   * rejects max_tokens (only max_completion_tokens is accepted),
+  #   * refuses function tools together with reasoning_effort, counting an
+  #     omitted effort as non-none — so a tools request must send "none",
+  #   * refuses temperature/top_p while reasoning is on (they are accepted
+  #     once the effort is "none"),
+  # and on the Anthropic mount additionally refuses thinking and max_tokens.
+  # Only the affected family is touched: every other model's bytes are
+  # forwarded unchanged. Requests larger than max_rewrite_bytes are
+  # forwarded unrewritten (the retry buffer may still hold them, which only
+  # affects retries).
+  # Off by default: leave it off unless the upstream needs the fixups.
+  model_quirks: false
+  max_rewrite_bytes: 8388608  # 8 MiB: bounds the buffered rewrite path
+
 timeouts:
   connect: 10s        # TCP/TLS connect to upstream
   request: 30m        # total per-request ceiling (long generations)

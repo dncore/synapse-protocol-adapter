@@ -240,6 +240,16 @@ and headers (per the same filtering rules) go through, the request body is
 **never parsed or buffered**, and the response — including error statuses
 and bodies — is streamed back byte-for-byte with a flush per read.
 
+The one opt-in exception is `passthrough.model_quirks`: with it enabled,
+bodies for model families whose API renamed or refuses a field the client
+sends are rewritten before forwarding — today the `gpt-6` family
+(`max_tokens` → `max_completion_tokens`, `reasoning_effort:"none"` injected
+whenever tools are present, `temperature`/`top_p` dropped while reasoning is
+on, and on the Anthropic mount also `thinking` dropped and `max_tokens`
+renamed). Every other body — including every other model — still goes
+through untouched, and bodies above `passthrough.max_rewrite_bytes` are
+forwarded unchanged.
+
 This means one port speaks both protocols: Responses clients hit
 `/v1/responses` (converted), native chat-completions clients hit
 `/v1/chat/completions` (forwarded as-is), and Codex's model picker gets a
@@ -272,6 +282,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | consecutive `function_call` items (parallel calls) | merged into ONE assistant message with N `tool_calls` |
 | `function_call` with only `id`, no `call_id` | `id` used as the tool call id |
 | `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); with `tools` on **gpt-6** it is forced to `"none"` — the shared gateway rejects tools × effort, and an omitted effort counts as non-none |
+| `temperature`, `top_p` | same names — but on **gpt-6** they are dropped while reasoning is on (that model answers 400 for any value other than the default there) and kept in the shapes that turn reasoning off (tools present, or an explicit `reasoning_effort:"none"`) |
 | tool `parameters` without top-level `type` | `{"type":"object"}` injected (several providers require it) |
 | `input[]` `message` items | messages (`system`/`developer`/`user`/`assistant` roles pass through) |
 | `input_text` / `output_text` / `summary_text` parts | `{type:"text"}` parts |
@@ -375,6 +386,8 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `upstream_retry.max_backoff` | `15s` | `PROXY_UPSTREAM_RETRY_MAX_BACKOFF` | Per-wait cap (also clamps `Retry-After`) |
 | `upstream_retry.budget` | `60s` | `PROXY_UPSTREAM_RETRY_BUDGET` | Total time spent waiting between attempts; beyond it the last 429 goes to the client |
 | `upstream_retry.buffer_max_bytes` | `4194304` | `PROXY_UPSTREAM_RETRY_BUFFER_MAX_BYTES` | Largest passthrough body buffered for replay; larger or length-less bodies stream and are not retried |
+| `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | Rewrite request bodies on the transparent routes for the model families whose API renamed or refuses a field the client sends (currently `gpt-6`); off means the routes never touch the client's bytes |
+| `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | Largest body `model_quirks` will rewrite; larger requests are forwarded unchanged |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | Total per-request ceiling (long generations) |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | Idle keep-alive connections |
@@ -887,6 +900,7 @@ Metrics (all low-cardinality; never any header, credential, or prompt data):
 | `protocol_proxy_upstream_errors_total{class}` | counter | upstream failures |
 | `protocol_proxy_streaming_requests_total` | counter | SSE streams started |
 | `protocol_proxy_passthrough_requests_total` | counter | requests transparently forwarded (no conversion) |
+| `protocol_proxy_passthrough_rewrites_total` | counter | passthrough bodies rewritten by `model_quirks`, labeled by rule (`max_tokens`, `reasoning_effort`, `sampling`, `thinking`) |
 | `protocol_proxy_tool_calls_total` | counter | tool calls observed in output |
 | `protocol_proxy_bytes_in_total` / `_bytes_out_total` | counter | body bytes in/out |
 | `protocol_proxy_upstream_requests_total` | counter | upstream calls issued |

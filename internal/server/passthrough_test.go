@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -440,5 +441,168 @@ func TestPassthrough_AnthropicHostRoot(t *testing.T) {
 	}
 	if gotKey != "sk-ant-test" {
 		t.Fatalf("x-api-key not forwarded verbatim: %q", gotKey)
+	}
+}
+
+// --- model quirks (passthrough.model_quirks) -------------------------------
+
+// newQuirksTestServer wires the same test config as the other passthrough
+// tests, with the quirk rewriter switched on.
+func newQuirksTestServer(t *testing.T, upstreamURL string) *Server {
+	t.Helper()
+	cfg := testConfig(upstreamURL)
+	cfg.Passthrough.ModelQuirks = true
+	return New(cfg, newTestLogger(), newTestRegistry())
+}
+
+// A gpt-6 body from a chat client (grok CLI / opencode shape: max_tokens and
+// tools, no reasoning_effort) must reach the upstream in the shape the
+// gateway answers 200 to. Measured upstream behavior, 2026-09-30.
+func TestPassthrough_ModelQuirksRewriteChatBody(t *testing.T) {
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"c1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+
+	s := newQuirksTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	body := `{"model":"gpt-6-luna","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read_file"}}],"max_tokens":32000,"stream":false}`
+	resp, err := http.Post(proxy.URL+"/api/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &doc); err != nil {
+		t.Fatalf("upstream body is not JSON: %v\n%s", err, gotBody)
+	}
+	if string(doc["max_completion_tokens"]) != "32000" {
+		t.Fatalf("upstream must see max_completion_tokens, got %s", gotBody)
+	}
+	if string(doc["reasoning_effort"]) != `"none"` {
+		t.Fatalf("upstream must see reasoning_effort=none, got %s", gotBody)
+	}
+	if _, ok := doc["max_tokens"]; ok {
+		t.Fatalf("max_tokens must not reach the upstream, got %s", gotBody)
+	}
+	if s.metrics.PassthroughRewritesTotal == nil {
+		t.Fatal("rewrite counter missing")
+	}
+}
+
+// The Anthropic mount keeps its host-root path and gets the rename plus the
+// thinking drop.
+func TestPassthrough_ModelQuirksRewriteAnthropicBody(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	}))
+	defer up.Close()
+
+	s := newQuirksTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	body := `{"model":"gpt-6-luna","max_tokens":1024,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(proxy.URL+"/api/anthropic/v1/messages", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotPath != "/api/anthropic/v1/messages" {
+		t.Fatalf("anthropic mount must keep its path, upstream saw %s", gotPath)
+	}
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &doc); err != nil {
+		t.Fatalf("upstream body is not JSON: %v\n%s", err, gotBody)
+	}
+	if string(doc["max_completion_tokens"]) != "1024" {
+		t.Fatalf("max_tokens must be renamed on the anthropic mount, got %s", gotBody)
+	}
+	if _, ok := doc["thinking"]; ok {
+		t.Fatalf("thinking must not reach the upstream, got %s", gotBody)
+	}
+}
+
+// With the feature off (the default) the route stays byte-for-byte.
+func TestPassthrough_ModelQuirksOffIsByteExact(t *testing.T) {
+	var gotBody string
+	proxy, _ := newPassthroughTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	body := `{"model":"gpt-6-luna","messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"max_tokens":5}`
+	resp, err := http.Post(proxy.URL+"/api/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotBody != body {
+		t.Fatalf("quirks off must not touch the body:\n got %s\nwant %s", gotBody, body)
+	}
+}
+
+// Models outside the family keep their bytes even with the rewriter on.
+func TestPassthrough_ModelQuirksOtherModelsUntouched(t *testing.T) {
+	var gotBody string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	s := newQuirksTestServer(t, up.URL)
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	body := `{"model":"glm-5.3","messages":[],"max_tokens":32,"temperature":0.7}`
+	resp, err := http.Post(proxy.URL+"/api/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotBody != body {
+		t.Fatalf("other models must pass through unrewritten:\n got %s\nwant %s", gotBody, body)
+	}
+}
+
+// Bodies above passthrough.max_rewrite_bytes stream through unrewritten: the
+// rewriter must not silently buffer arbitrarily large requests.
+func TestPassthrough_ModelQuirksLargeBodyStreamsUnrewritten(t *testing.T) {
+	var gotBody string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	cfg := testConfig(up.URL)
+	cfg.Passthrough.ModelQuirks = true
+	cfg.Passthrough.MaxRewriteBytes = 1024
+	s := New(cfg, newTestLogger(), newTestRegistry())
+	proxy := httptest.NewServer(s.httpSrv.Handler)
+	defer proxy.Close()
+
+	body := `{"model":"gpt-6-luna","messages":[{"role":"user","content":"` + strings.Repeat("x", 2048) + `"}],"max_tokens":5}`
+	resp, err := http.Post(proxy.URL+"/api/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotBody != body {
+		t.Fatal("a body above max_rewrite_bytes must stream through unchanged")
 	}
 }

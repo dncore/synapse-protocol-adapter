@@ -14,9 +14,11 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/responses"
 )
 
-// isGPT6 reports whether the model id names a gpt-6-family model
-// (case-insensitive substring, so dated and aliased ids match).
-func isGPT6(model string) bool {
+// IsGPT6 reports whether the model id names a gpt-6-family model
+// (case-insensitive substring, so dated and aliased ids match). Exported
+// so the passthrough rewriter (internal/server) applies the same family
+// rule as the converter.
+func IsGPT6(model string) bool {
 	return strings.Contains(strings.ToLower(model), "gpt-6")
 }
 
@@ -49,7 +51,7 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 	// API renamed the field: gpt-6 rejects max_tokens with a 400 ("Use
 	// 'max_completion_tokens' instead"), the gpt-5.6 family accepts both.
 	if req.MaxOutputTokens != nil {
-		if isGPT6(req.Model) {
+		if IsGPT6(req.Model) {
 			out.MaxCompletionTokens = req.MaxOutputTokens
 		} else {
 			out.MaxTokens = req.MaxOutputTokens
@@ -67,8 +69,20 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 	// "none" (omitting it 400s just like "high"). Codex always sends tools,
 	// which is why every gpt-6 tool turn failed. Cost: no thinking on tool
 	// turns; that is the upstream's limitation, not a choice made here.
-	if len(out.Tools) > 0 && isGPT6(req.Model) {
+	if len(out.Tools) > 0 && IsGPT6(req.Model) {
 		out.ReasoningEffort = "none"
+	}
+	// gpt-6 refuses temperature/top_p while reasoning is ON ("does not
+	// support 0.7 with this model. Only the default (1) value is
+	// supported"), but accepts them once the effort is "none" — measured
+	// against the gateway. The effort sent is the one decided above: tools
+	// force "none", an explicit "none" passes through, anything else (or an
+	// omitted effort, which the upstream reads as non-none) keeps reasoning
+	// on. Dropping the sampling params there is the only way the request
+	// survives; leaving them would 400 the whole turn.
+	if IsGPT6(req.Model) && out.ReasoningEffort != "none" {
+		out.Temperature = nil
+		out.TopP = nil
 	}
 	if req.Stream {
 		out.StreamOptions = &completions.StreamOptions{IncludeUsage: true}

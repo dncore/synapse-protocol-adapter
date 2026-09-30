@@ -33,9 +33,35 @@ type Config struct {
 	Limits        Limits        `yaml:"limits"`
 	Users         Users         `yaml:"users"`
 	UpstreamRetry UpstreamRetry `yaml:"upstream_retry"`
+	Passthrough   Passthrough   `yaml:"passthrough"`
 	Timeouts      Timeouts      `yaml:"timeouts"`
 	Shutdown      Shutdown      `yaml:"shutdown"`
 	Log           Log           `yaml:"log"`
+}
+
+// Passthrough tunes the transparent routes (/v1/*, /api/v1/*,
+// /api/anthropic/*). Their contract is to forward requests byte for byte;
+// the switches here are the deliberate exceptions, each one a fix for a
+// client shape the configured upstream rejects.
+type Passthrough struct {
+	// ModelQuirks rewrites request bodies for model families whose API
+	// renamed or rejected a field the client sends (currently the gpt-6
+	// family, see the dialect notes in internal/converter and
+	// internal/server/normalize.go). Off by default: without it these
+	// routes never touch the client's bytes.
+	//
+	// What it fixes, and only for the affected family:
+	//   max_tokens → max_completion_tokens          (the family rejects max_tokens)
+	//   reasoning_effort="none" injected when tools are present
+	//                                              (tools × reasoning is rejected, and an omitted effort counts as non-none)
+	//   temperature/top_p dropped while reasoning is on
+	//                                              (sampling params are refused in that mode)
+	//   thinking dropped, max_tokens renamed on the Anthropic mount
+	ModelQuirks bool `yaml:"model_quirks"`
+	// MaxRewriteBytes is the largest body the rewriter will touch: larger
+	// requests are forwarded unrewritten (the retry buffer may still hold
+	// them, that only affects retries). Default 8 MiB.
+	MaxRewriteBytes int64 `yaml:"max_rewrite_bytes"`
 }
 
 // Server is the listener configuration.
@@ -212,6 +238,10 @@ func Defaults() Config {
 			Budget:         60 * time.Second,
 			BufferMaxBytes: 4 << 20, // 4 MiB: LLM JSON bodies fit; media uploads stream
 		},
+		Passthrough: Passthrough{
+			ModelQuirks:     false,
+			MaxRewriteBytes: 8 << 20, // 8 MiB: rewritten bodies are chat/anthropic JSON, not media
+		},
 		Timeouts: Timeouts{
 			Connect:     10 * time.Second,
 			Request:     30 * time.Minute,
@@ -371,6 +401,16 @@ func applyEnv(cfg *Config) {
 			cfg.UpstreamRetry.BufferMaxBytes = n
 		}
 	}
+	if v := os.Getenv("PROXY_PASSTHROUGH_MODEL_QUIRKS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Passthrough.ModelQuirks = b
+		}
+	}
+	if v := os.Getenv("PROXY_PASSTHROUGH_MAX_REWRITE_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Passthrough.MaxRewriteBytes = int64(n)
+		}
+	}
 	if v := os.Getenv("PROXY_TIMEOUTS_CONNECT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Timeouts.Connect = d
@@ -451,6 +491,9 @@ func Validate(cfg *Config) error {
 	}
 	if err := validateUpstreamRetry(cfg); err != nil {
 		errs = append(errs, err)
+	}
+	if cfg.Passthrough.MaxRewriteBytes <= 0 {
+		errs = append(errs, errors.New("passthrough.max_rewrite_bytes must be > 0 (e.g. 8388608)"))
 	}
 	if cfg.Timeouts.Connect <= 0 {
 		errs = append(errs, errors.New("timeouts.connect must be > 0 (e.g. 10s)"))

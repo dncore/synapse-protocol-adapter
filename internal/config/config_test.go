@@ -399,3 +399,20 @@ func TestWarnings_QueueTimeout(t *testing.T) {
 		t.Fatalf("disabled queueing must not warn: %v", got)
 	}
 }
+
+func TestPassthroughDefaultsAndValidation(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Passthrough.ModelQuirks {
+		t.Fatal("passthrough.model_quirks must default to off: the route never rewrites semantics unless asked")
+	}
+	if cfg.Passthrough.MaxRewriteBytes != 8<<20 {
+		t.Fatalf("passthrough.max_rewrite_bytes default = %d, want 8 MiB", cfg.Passthrough.MaxRewriteBytes)
+	}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+	cfg.Passthrough.MaxRewriteBytes = 0
+	if err := Validate(&cfg); err == nil || !strings.Contains(err.Error(), "max_rewrite_bytes") {
+		t.Fatalf("zero max_rewrite_bytes must be rejected, got %v", err)
+	}
+}

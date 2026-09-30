@@ -31,6 +31,7 @@ type Registry struct {
 	Upstream429Total         *LabeledCounter
 	RetriesAbsorbedTotal     *Counter
 	RetryExhaustedTotal      *Counter
+	PassthroughRewritesTotal *LabeledCounter
 
 	// Gauges.
 	ActiveConnections *Gauge
@@ -63,6 +64,7 @@ func NewRegistry() *Registry {
 		Upstream429Total:         &LabeledCounter{Name: "protocol_proxy_upstream_429_total", Help: "HTTP 429 responses received from the upstream, by route.", Label: "route"},
 		RetriesAbsorbedTotal:     &Counter{Name: "protocol_proxy_429_absorbed_total", Help: "Upstream 429s absorbed by a retry (each retry issued)."},
 		RetryExhaustedTotal:      &Counter{Name: "protocol_proxy_429_exhausted_total", Help: "Requests that gave up waiting after their retry budget was exhausted."},
+		PassthroughRewritesTotal: &LabeledCounter{Name: "protocol_proxy_passthrough_rewrites_total", Help: "Passthrough request bodies rewritten by the model-quirk normalizer, by rule.", Label: "rule"},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -210,6 +212,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeLabeled(r.ErrorsTotal)
 	writeLabeled(r.UpstreamErrorsTotal)
 	writeLabeled(r.QueueRejectedTotal)
+	writeLabeled(r.PassthroughRewritesTotal)
 	writeLabeled(r.Upstream429Total)
 
 	writeGauge := func(g *Gauge) {
