@@ -77,8 +77,18 @@ func (s *Server) handleAnthropicTakeover(w http.ResponseWriter, r *http.Request,
 
 	harness := &anthropicTakeoverHarness{s: s, r: r, req: req, start: start}
 	upstream.ForwardResponseHeaders(w.Header(), nil)
+	// The chat route authenticates with `Authorization: Bearer`, while
+	// Anthropic clients may send only `x-api-key` (ANTHROPIC_API_KEY) — the
+	// upstream's own Anthropic mount accepts both, so the takeover has to
+	// translate. Without this, x-api-key clients get 401 here.
+	headers := r.Header.Clone()
+	if headers.Get("Authorization") == "" {
+		if k := headers.Get("X-Api-Key"); k != "" {
+			headers.Set("Authorization", "Bearer "+k)
+		}
+	}
 	attempt := func() (*http.Response, error) {
-		return s.client.Do(ctx, chatBody, r.Header, req.Stream)
+		return s.client.Do(ctx, chatBody, headers, req.Stream)
 	}
 	resp, err := s.doUpstreamRetry(ctx, r, harness.logLabel(), true, attempt)
 	if err != nil {

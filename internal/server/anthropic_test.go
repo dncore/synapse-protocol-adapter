@@ -52,9 +52,10 @@ func postAnthropic(t *testing.T, base, body string) *http.Response {
 // the chat route, with the family dialect applied (max_completion_tokens,
 // reasoning_effort=none, no thinking) and the Anthropic body's content mapped.
 func TestAnthropicTakeover_ConvertsToolTurn(t *testing.T) {
-	var gotPath, gotBody string
+	var gotPath, gotBody, gotAuth string
 	proxy, _ := newTakeoverTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		w.Header().Set("Content-Type", "application/json")
@@ -69,6 +70,12 @@ func TestAnthropicTakeover_ConvertsToolTurn(t *testing.T) {
 	}
 	if gotPath != "/chat/completions" {
 		t.Fatalf("takeover must call the chat route, upstream saw %s", gotPath)
+	}
+
+	// The client authenticated with x-api-key (ANTHROPIC_API_KEY); the chat
+	// route wants Bearer, so the takeover must synthesize it.
+	if gotAuth != "Bearer sk-test" {
+		t.Fatalf("x-api-key must be translated to a Bearer header, upstream saw %q", gotAuth)
 	}
 
 	var chat map[string]json.RawMessage
