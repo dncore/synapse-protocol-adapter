@@ -117,7 +117,81 @@ func TestConvert_EmulatedTurnStreamsResponsesEvents(t *testing.T) {
 	}
 }
 
+// chat 直通路径:窗口内工具回合同样由模拟接管(此前只有 /responses 与
+// Anthropic 挂载有模拟,pi/reasonix 这类 chat 客户端在窗口里拿不到)。
+// 流式客户端应拿到合成的 chat 分片流。
+func TestPassthrough_EmulatesToolCallsWhenModelUnavailable(t *testing.T) {
+	var upstream []string
+	proxy := newEmulationProxy(t, emulationConfig(), emulatedReply, &upstream)
+
+	reqBody := `{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"Call get_time for Shanghai."}],
+	  "tools":[{"type":"function","function":{"name":"get_time","description":"time","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}`
+	req, _ := http.NewRequest("POST", proxy.URL+"/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Choices) != 1 || len(out.Choices[0].Message.ToolCalls) != 1 ||
+		out.Choices[0].Message.ToolCalls[0].Function.Name != "get_time" ||
+		out.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("应还原成 chat tool_calls: %+v", out)
+	}
+	// 上游收到:无 tools 字段 + 协议在提示词里 + 非流式
+	if len(upstream) != 1 {
+		t.Fatalf("上游请求数 = %d", len(upstream))
+	}
+	sent := upstream[0]
+	if strings.Contains(sent, `"tools"`) || strings.Contains(sent, `"stream":true`) {
+		t.Fatalf("上游不该收到 tools 或 stream:true:\n%s", sent)
+	}
+	if !strings.Contains(sent, "tool_calls") || !strings.Contains(sent, "[tool result]") {
+		t.Fatalf("协议未写进提示词:\n%s", sent)
+	}
+
+	// 流式客户端:合成 chat 分片,含 tool_calls 与结束标记。
+	streamBody := `{"model":"gpt-6.1-sol","stream":true,"messages":[{"role":"user","content":"Call get_time for Shanghai."}],
+	  "tools":[{"type":"function","function":{"name":"get_time","description":"time","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}`
+	sreq, _ := http.NewRequest("POST", proxy.URL+"/v1/chat/completions", strings.NewReader(streamBody))
+	sreq.Header.Set("Content-Type", "application/json")
+	sresp, err := http.DefaultClient.Do(sreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sresp.Body.Close()
+	sraw, _ := io.ReadAll(sresp.Body)
+	s := string(sraw)
+	for _, want := range []string{"chat.completion.chunk", `"tool_calls"`, "get_time", "data: [DONE]"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("流式分片缺 %q:\n%s", want, s)
+		}
+	}
+}
+
 // 不在配置名单里的模型、或没被标记不可用的模型:一律走原生 tools,不做模拟。
+
 func TestConvert_NoEmulationOutsideItsConditions(t *testing.T) {
 	cfg := emulationConfig()
 	cfg.ToolEmulation.Models = []string{"gpt-6-sol"} // 当前模型不在名单

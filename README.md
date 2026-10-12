@@ -631,7 +631,9 @@ calling failing 100% for those ids at that moment): the protocol reply parsed
 full Codex-shaped exchange (tool call → tool result → answer) plus the
 streaming event sequence (`response.function_call_arguments.delta/done`)
 completed through the proxy — as did the same exchange on the Anthropic mount
-for Claude Code.
+for Claude Code, and on the plain chat route (`/v1/chat/completions`) for
+chat-shaped agent clients, streaming clients included (synthesized chat
+chunks). All three routes share the same takeover and accounting rules.
 
 What it is not: it never overrides a configured fallback, it never applies to
 ids that are not listed, and it leaves the request untouched whenever the

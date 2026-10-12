@@ -78,7 +78,9 @@ type ModelHealth struct {
 // "chat → responses routing": while a model is marked unavailable by
 // model_health (i.e. its native tool calling is failing), the tools are
 // described in the prompt instead of the `tools` field and the model's reply
-// is parsed back into a real tool call.
+// is parsed back into a real tool call. Applies to all three tool-bearing
+// routes: /v1/responses (converted), the Anthropic mount, and the plain chat
+// passthrough.
 //
 // This is a fidelity trade: the model sees tools as text, so it is only used
 // for the ids listed here and only while those ids are failing. Leave

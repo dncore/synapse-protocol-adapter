@@ -3,13 +3,16 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/dncore/synapse-protocol-adapter/internal/completions"
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
+	"github.com/dncore/synapse-protocol-adapter/internal/converter"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 	"github.com/dncore/synapse-protocol-adapter/internal/middleware"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
@@ -94,6 +97,35 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Tool-call emulation for chat clients while the model's native tool
+	// calling is failing — the same contract as the Responses and Anthropic
+	// routes (tool_emulation config, marked models only): the tools move into
+	// the prompt, the upstream call becomes non-streaming (the protocol reply
+	// must be complete before it can be parsed), and the reply is parsed back
+	// into a real tool_calls answer. Streaming clients get synthesized chat
+	// chunks.
+	emulating := false
+	model, hasTools := bodyModelShape(buffered)
+	var clientStreams bool
+	if buffered != nil && s.shouldEmulate(model, hasTools) {
+		var req completions.Request
+		if err := json.Unmarshal(buffered, &req); err == nil {
+			toolCount := len(req.Tools)
+			if converter.EmulateToolProtocol(&req) {
+				clientStreams = req.Stream
+				req.Stream = false
+				req.StreamOptions = nil
+				if nb, merr := json.Marshal(&req); merr == nil {
+					buffered = nb
+					emulating = true
+					s.metrics.ToolEmulationTotal.With(model).Inc()
+					s.logger.Warn("emulating tool calls in the prompt (upstream tool calling unavailable)",
+						"request_id", middleware.RequestIDOf(r), "model", model, "tools", toolCount)
+				}
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeouts.Request)
 	defer cancel()
 
@@ -113,11 +145,16 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		return s.client.DoPassthrough(ctx, r.Method,
 			stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
 	}
-	// The model and shape are read off the (possibly rewritten) body purely
-	// for the per-model health bookkeeping; an unparsable body just means
-	// "unknown".
-	model, hasTools := bodyModelShape(buffered)
-	resp, err := s.doUpstreamRetry(ctx, r, "passthrough", buffered != nil, healthKey(model, hasTools), attempt)
+	// model/hasTools were read off the body before the emulation rewrite,
+	// purely for the per-model health bookkeeping.
+	healthModel := healthKey(model, hasTools)
+	if emulating {
+		// An emulated success is our prompting, not the upstream's tool
+		// calling recovering — never health evidence (same as the other
+		// routes).
+		healthModel = ""
+	}
+	resp, err := s.doUpstreamRetry(ctx, r, "passthrough", buffered != nil, healthModel, attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -140,6 +177,10 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		// body): answer with Retry-After instead of mirroring it bare.
 		s.metrics.UpstreamErrorsTotal.With("http_4xx").Inc()
 		s.rejectUpstream429(w, resp)
+		return
+	}
+	if emulating && resp.StatusCode < http.StatusBadRequest {
+		s.writeEmulatedChatResponse(w, r, resp, clientStreams)
 		return
 	}
 
@@ -180,6 +221,59 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 	s.metrics.ResponsesTotal.Inc()
 	s.metrics.RequestDuration.Observe(time.Since(start).Seconds())
+}
+
+// writeEmulatedChatResponse turns an emulated (necessarily complete) upstream
+// chat reply into the client's answer: the protocol payload is parsed back
+// into a real tool_calls response and re-rendered — as chat JSON, or as
+// synthesized chat SSE chunks for streaming clients. A reply that is not the
+// protocol (the model answered in text) passes through unchanged, and so does
+// any body that does not parse as a chat response at all.
+func (s *Server) writeEmulatedChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, clientStreams bool) {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		s.writeProxyError(w, http.StatusBadGateway, "upstream read failed: "+err.Error())
+		return
+	}
+	var out completions.Response
+	if json.Unmarshal(raw, &out) != nil {
+		// Not a shape the parser knows: hand the upstream bytes through
+		// untouched rather than losing them.
+		upstream.ForwardResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		n, _ := w.Write(raw)
+		s.metrics.BytesOutTotal.Add(int64(n))
+		s.metrics.ResponsesTotal.Inc()
+		return
+	}
+	if len(out.Choices) > 0 {
+		msg := &out.Choices[0].Message
+		if name, args, ok := converter.ParseEmulatedToolCall(msg.Content.String); ok {
+			if converter.ApplyEmulatedToolCall(&out, emulatedCallID(), name, args) {
+				s.metrics.ToolEmulationParsedTotal.Inc()
+				s.logger.Info("emulated tool call parsed from the model's reply",
+					"request_id", middleware.RequestIDOf(r), "tool", name,
+					"call_id", msg.ToolCalls[0].ID)
+			}
+		}
+	}
+	var body []byte
+	if clientStreams {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		body = converter.SynthesizeChatSSE(&out)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		body, err = json.Marshal(&out)
+		if err != nil {
+			s.writeProxyError(w, http.StatusInternalServerError, "internal conversion error")
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	n, _ := w.Write(body)
+	s.metrics.BytesOutTotal.Add(int64(n))
+	s.metrics.ResponsesTotal.Inc()
 }
 
 // stripAPIPrefix removes the client-facing API prefix (/v1 or /api/v1) so
