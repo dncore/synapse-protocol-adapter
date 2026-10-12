@@ -73,16 +73,16 @@ func ConvertRequest(req *responses.Request) (*completions.Request, error) {
 // ApplyChatDialect applies the per-model-family chat request rules that every
 // conversion route must honor (Responses→Chat and Anthropic→Chat alike).
 // Rules are measured facts about the shared gateway, dated in the comments;
-// see the README's "Model-family constraints" for the evidence.
+// see modelcaps.go for the per-model measurements and the README's
+// "Model-family constraints" for the family-level ones.
 //
 //	gpt-6: max_tokens → max_completion_tokens   (only the latter is accepted)
-//	       tools present → reasoning_effort "none" (tools × effort is rejected,
-//	       and an omitted effort counts as non-none — omitting 400s like "high")
-//	       reasoning on → temperature/top_p dropped (refused in that mode,
-//	       accepted once the effort is "none")
+//	       tools present → an explicit reasoning_effort from the model's own
+//	       set (see NormalizeGPT6Effort) and no temperature/top_p
+//	       no tools → sampling stays on the ids that accept it
 //
-// Call it after the request is assembled: it only moves/removes fields the
-// caller set, never invents one.
+// Call it after the request is assembled: it only moves/replaces/removes
+// fields the caller set, never invents one beyond the effort the shape needs.
 func ApplyChatDialect(model string, out *completions.Request) {
 	if !IsGPT6(model) {
 		return
@@ -91,10 +91,9 @@ func ApplyChatDialect(model string, out *completions.Request) {
 		out.MaxCompletionTokens = out.MaxTokens
 		out.MaxTokens = nil
 	}
-	if len(out.Tools) > 0 {
-		out.ReasoningEffort = "none"
-	}
-	if out.ReasoningEffort != "none" {
+	hasTools := len(out.Tools) > 0
+	out.ReasoningEffort = NormalizeGPT6Effort(model, out.ReasoningEffort, hasTools)
+	if GPT6StripsSampling(model, hasTools, out.ReasoningEffort) {
 		out.Temperature = nil
 		out.TopP = nil
 	}
