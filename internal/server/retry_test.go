@@ -64,46 +64,14 @@ func TestTransientStreamErrorClassification(t *testing.T) {
 	}
 }
 
-// 200 + 首帧错误:记一次失败并按预算重试;重试成功后的流式字节原样保留(含首帧)。
-func TestUpstreamRetryAbsorbsStreamedErrorFrame(t *testing.T) {
+// 200 + 首帧错误:响应原样透传、本请求不重试(帧可能数秒后才到),判定异步
+// 落地为一个失败计数 —— 下一个请求才因此进入模拟接管。
+func TestUpstreamStreamErrorFrameCountsLate(t *testing.T) {
 	cfg := fastRetryConfig()
 	s := retryTestServer(cfg)
 	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
 	var calls atomic.Int64
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
-		func() (*http.Response, error) {
-			if calls.Add(1) == 1 {
-				return mkSSEResp("data: {\"error\": {\"message\": \"Provider returned 400\", \"type\": \"api_error\", \"http_status\": 400}}\n\n"), nil
-			}
-			return mkSSEResp("data: {\"id\":\"chatcmpl-1\",\"choices\":[]}\n\ndata: [DONE]\n\n"), nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := calls.Load(); got < 2 {
-		t.Fatalf("首帧错误的 200 应触发重试,实际尝试 %d 次", got)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "chatcmpl-1") || !strings.Contains(string(body), "[DONE]") {
-		t.Fatalf("重试后的流式字节被破坏: %q", body)
-	}
-	// 被重试吸收:与 429 语义一致,成功即清零。
-	if s.health.unavailable("gpt-6.1-sol") || s.health.failureCount("gpt-6.1-sol") != 0 {
-		t.Fatal("重试吸收成功后的健康状态应干净")
-	}
-}
-
-// 已标记模型:流式错误 200 不重试、不当作恢复——标记必须保持(否则流式客户端
-// 在窗口内永远无法触发模拟接管)。
-func TestUpstreamStreamErrorFrameKeepsMark(t *testing.T) {
-	cfg := fastRetryConfig()
-	s := retryTestServer(cfg)
-	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
-	s.health.noteFailure("gpt-6.1-sol")
-	s.health.noteFailure("gpt-6.1-sol")
-	var calls atomic.Int64
-	_, err := s.doUpstreamRetry(context.Background(),
 		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
 		func() (*http.Response, error) {
 			calls.Add(1)
@@ -112,11 +80,78 @@ func TestUpstreamStreamErrorFrameKeepsMark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Provider returned 400") {
+		t.Fatalf("错误帧应原样透传给客户端: %q", body)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("流式错误帧不做同请求重试,实际 %d 次", got)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for s.health.failureCount("gpt-6.1-sol") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.health.failureCount("gpt-6.1-sol"); got != 1 {
+		t.Fatalf("失败计数 = %d, want 1", got)
+	}
+}
+
+// 已标记模型:流式错误帧不得当作恢复(否则流式客户端在窗口内永远无法触发
+// 模拟接管)。
+func TestUpstreamStreamErrorFrameKeepsMark(t *testing.T) {
+	cfg := fastRetryConfig()
+	s := retryTestServer(cfg)
+	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
+	s.health.noteFailure("gpt-6.1-sol")
+	s.health.noteFailure("gpt-6.1-sol")
+	var calls atomic.Int64
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
+		func() (*http.Response, error) {
+			calls.Add(1)
+			return mkSSEResp("data: {\"error\": {\"message\": \"Provider returned 400\", \"type\": \"api_error\", \"http_status\": 400}}\n\n"), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("已标记模型应只打一次,实际 %d", got)
 	}
+	time.Sleep(50 * time.Millisecond) // 让判定落地
 	if !s.health.unavailable("gpt-6.1-sol") {
-		t.Fatal("流式错误 200 不得清掉标记")
+		t.Fatal("流式错误帧不得清掉标记")
+	}
+}
+
+// 干净首帧:晚些记一次成功(可清除标记),字节原样。
+func TestUpstreamCleanStreamVerdictRecorded(t *testing.T) {
+	cfg := fastRetryConfig()
+	s := retryTestServer(cfg)
+	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
+	s.health.noteFailure("gpt-6.1-sol")
+	s.health.noteFailure("gpt-6.1-sol")
+	if !s.health.unavailable("gpt-6.1-sol") {
+		t.Fatal("前置:应已标记")
+	}
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
+		func() (*http.Response, error) {
+			return mkSSEResp("data: {\"id\":\"chatcmpl-1\",\"choices\":[]}\n\ndata: [DONE]\n\n"), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "chatcmpl-1") || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("流式字节被破坏: %q", body)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for s.health.unavailable("gpt-6.1-sol") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.health.unavailable("gpt-6.1-sol") {
+		t.Fatal("干净首帧应被记为成功并清除标记")
 	}
 }
 

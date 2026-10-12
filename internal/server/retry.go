@@ -171,11 +171,14 @@ func startSSEFrameClassifier(resp *http.Response) <-chan bool {
 				break
 			}
 		}
-		if isTransientStreamError(frame.Bytes()) {
-			verdict <- true
+		// The verdict is sent for every non-empty first frame — true for the
+		// gateway's error frame, false for a real one — and the channel closes
+		// right away (not at stream end), so a watcher resolves the moment the
+		// frame is classified. An empty frame (stream aborted before any
+		// bytes) sends nothing: there is no verdict to record.
+		if frame.Len() > 0 {
+			verdict <- isTransientStreamError(frame.Bytes())
 		}
-		// Verdict closes as soon as the first frame is classified — not at
-		// stream end — so clean streams resolve the wait immediately.
 		close(verdict)
 		if _, err := pw.Write(frame.Bytes()); err != nil {
 			return // consumer went away
@@ -185,23 +188,36 @@ func startSSEFrameClassifier(resp *http.Response) <-chan bool {
 	return verdict
 }
 
-// awaitStreamVerdict waits up to the bound for the classifier's verdict. A
-// closed channel (clean frame, EOF, non-SSE) returns immediately; no verdict
-// within the bound means a live stream whose first frame is still coming.
-func awaitStreamVerdict(verdict <-chan bool) bool {
-	select {
-	case bad := <-verdict:
-		return bad
-	case <-time.After(streamPeekWindow):
-		return false
+// watchStreamVerdict records the classifier's verdict whenever it lands —
+// without waiting for it. Measured 2026-10-12: the gateway's error frame can
+// take several seconds to arrive (its headers are immediate; its body waits
+// on the gateway's own upstream timeout), while a reasoning model's first
+// real token can take a minute. Waiting before returning the response would
+// stall the first group of streams and still miss the second — recording
+// late is enough, because the mark decides the NEXT request (which is how
+// the non-streaming path recovers too).
+func (s *Server) watchStreamVerdict(verdict <-chan bool, route, model string, r *http.Request) {
+	if model == "" {
+		return // nothing to record against
 	}
+	go func() {
+		bad, ok := <-verdict
+		if !ok {
+			// Stream ended (or aborted) before any frame: no verdict to record.
+			return
+		}
+		if bad {
+			if s.health.noteFailure(model) {
+				s.logger.Warn("model marked unavailable after repeated channel-rotation failures (streamed frame)",
+					"request_id", middleware.RequestIDOf(r), "route", route, "model", model,
+					"threshold", s.cfg.ModelHealth.FailureThreshold,
+					"cooldown", s.cfg.ModelHealth.Cooldown.String())
+			}
+			return
+		}
+		s.health.noteSuccess(model)
+	}()
 }
-
-// streamPeekWindow bounds how long the first frame may take before a stream
-// is presumed real. The gateway's error frame lands within milliseconds; a
-// real first token can take a minute on reasoning models, and it is
-// forwarded as it arrives either way.
-const streamPeekWindow = 2 * time.Second
 
 // isTransientStreamError reports whether a peeked SSE frame carries the
 // gateway's streamed channel-rotation error. Classification reuses the
@@ -280,17 +296,20 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 	if err != nil {
 		return resp, err
 	}
-	// Error statuses are classified from their body. A 2xx is additionally
-	// watched for the gateway's streamed error frame (see
+	// Error statuses are classified from their body. A streaming 2xx is
+	// additionally watched for the gateway's streamed error frame (see
 	// startSSEFrameClassifier): the first frame is classified while a pump
-	// goroutine forwards every byte unchanged, so a real stream pays nothing
-	// and a slow first token is never held back. Non-SSE 2xx bodies are never
-	// read here.
+	// goroutine forwards every byte unchanged, and the verdict is recorded
+	// asynchronously (watchStreamVerdict) — headers and slow first tokens are
+	// never held back, and the streamed failure still marks the model for the
+	// next request. Non-SSE 2xx bodies are never read here.
 	if resp.StatusCode != http.StatusTooManyRequests {
 		transient := isCandidateTransientStatus(resp.StatusCode) &&
 			isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10))
-		if !transient && resp.StatusCode < http.StatusBadRequest {
-			transient = awaitStreamVerdict(startSSEFrameClassifier(resp))
+		if !transient && resp.StatusCode < http.StatusBadRequest &&
+			strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+			s.watchStreamVerdict(startSSEFrameClassifier(resp), route, model, r)
+			return resp, nil
 		}
 		if !transient {
 			if resp.StatusCode < http.StatusBadRequest {
@@ -309,11 +328,9 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 		if !canRetry {
 			return resp, nil
 		}
-		out, stillTransient, err := s.retryTransientUpstream(ctx, r, route, attempt, resp)
-		if err == nil && out != nil && !stillTransient && out.StatusCode < http.StatusBadRequest {
-			s.health.noteSuccess(model)
-		}
-		return out, err
+		// retryTransientUpstream accounts for the final response itself
+		// (success — immediate or streamed-verdict — or nothing).
+		return s.retryTransientUpstream(ctx, r, route, model, attempt, resp)
 	}
 	s.metrics.Upstream429Total.With(route).Inc()
 	if !canRetry {
@@ -380,10 +397,11 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 // channel-rotation failure. Same budget/backoff machinery as the 429 path:
 // the retry happens while the caller still holds its queue slots (backpressure,
 // not piling on load), and the last response is returned untouched for the
-// caller to relay. The second return value reports whether that last
-// response is itself another channel-rotation failure (status- or
-// streamed-frame-classified): the caller must not count it as a recovery.
-func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, route string, attempt retryAttempt, resp *http.Response) (*http.Response, bool, error) {
+// caller to relay. The final response is accounted for here: an immediate
+// success is recorded now, a streaming success is recorded when its first
+// frame is classified (watchStreamVerdict), and an exhausted budget records
+// nothing further — the first attempt already counted the failure.
+func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, route, model string, attempt retryAttempt, resp *http.Response) (*http.Response, error) {
 	rc := s.cfg.UpstreamRetry
 	backoff := rc.InitialBackoff
 	attempts := 1
@@ -398,7 +416,7 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 			s.logger.Warn("upstream returned a channel-rotation error; retry budget exhausted",
 				"request_id", middleware.RequestIDOf(r), "route", route,
 				"status", resp.StatusCode, "attempts", attempts)
-			return resp, true, nil
+			return resp, nil
 		}
 		drainAndClose(resp)
 		s.metrics.RetriesAbsorbedTotal.Inc()
@@ -408,7 +426,7 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return nil, false, ctx.Err()
+			return nil, ctx.Err()
 		}
 		attempts++
 		if backoff < rc.MaxBackoff {
@@ -419,16 +437,20 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 		}
 		resp, err := attempt()
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		transient := isCandidateTransientStatus(resp.StatusCode) &&
-			isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10))
-		if !transient && resp.StatusCode < http.StatusBadRequest {
-			transient = awaitStreamVerdict(startSSEFrameClassifier(resp))
+		if isCandidateTransientStatus(resp.StatusCode) &&
+			isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10)) {
+			continue // still transient: spend more of the budget
 		}
-		if !transient {
-			return resp, false, nil
+		if resp.StatusCode < http.StatusBadRequest {
+			if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+				s.watchStreamVerdict(startSSEFrameClassifier(resp), route, model, r)
+			} else {
+				s.health.noteSuccess(model)
+			}
 		}
+		return resp, nil
 	}
 }
 
