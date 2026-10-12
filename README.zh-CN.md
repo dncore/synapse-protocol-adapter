@@ -224,11 +224,14 @@ body **从不解析、从不缓冲**，响应——包括错误状态码与错�
 
 唯一的例外是显式开关 `passthrough.model_quirks`：开启后，模型族自身
 API 改名或拒收某字段的请求体会在被转发前改写——目前只有 `gpt-6` 族
-（`max_tokens` → `max_completion_tokens`；带 `tools` 时注入
-`reasoning_effort:"none"`；推理开启时去掉 `temperature`/`top_p`；
-Anthropic 挂载上还会去掉 `thinking` 并改名 `max_tokens`）。其余任何
-请求体（包括其它所有模型）依旧逐字节透传；超过
-`passthrough.max_rewrite_bytes` 的请求体也不改写、原样转发。
+（`max_tokens` → `max_completion_tokens`；带 `tools` 的回合改成该模型
+**自己接受**的 `reasoning_effort`；上游拒收的位置去掉
+`temperature`/`top_p`；Anthropic 挂载上还会去掉 `thinking` 并改名
+`max_tokens`）。规则**按模型而不是按族**：Sol 两个 id 直接拒收 `"none"`、
+且在带工具的请求上拒收采样参数，luna 则保留早期的「带工具 ⇒ none」形状
+——测量记录见 `internal/converter/modelcaps.go`。其余任何请求体（包括
+其它所有模型）依旧逐字节透传；超过 `passthrough.max_rewrite_bytes` 的
+请求体也不改写、原样转发。
 
 一个端口同时说两种协议：Responses 客户端走 `/v1/responses`（转换），
 原生 chat-completions 客户端走 `/v1/chat/completions`（原样转发），
@@ -251,8 +254,8 @@ metrics 这些 socat 没有的能力。
 reasoning_effort are not supported…`）。只有这类请求由代理自己翻译
 （Anthropic ⇄ Chat）：`system` 块 → system 消息，text/image/tool_use/
 tool_result 块 → chat 内容与 `tool_calls`，`tools[].input_schema` → 嵌套
-function 参数，并按模型族方言发 `max_completion_tokens` +
-`reasoning_effort:"none"`；回程把 chat 结果还原成 Anthropic 内容块与 SSE
+function 参数，并按模型方言发 `max_completion_tokens` + 该模型接受的
+`reasoning_effort`；回程把 chat 结果还原成 Anthropic 内容块与 SSE
 事件（工具参数走 `input_json_delta`）。其余一切——其它模型、不带工具的
 回合、`count_tokens`、其它端点——仍原样走上游；映射器不完全认识的请求体
 **回退成透传**，不做有损翻译。
@@ -272,8 +275,8 @@ function 参数，并按模型族方言发 `max_completion_tokens` +
 | `developer` 角色消息 | 归一为 `system`（语义等价，普遍被接受） |
 | 连续 `function_call` item（并行调用） | 合并为一条带 N 个 `tool_calls` 的 assistant 消息 |
 | 只有 `id` 没有 `call_id` 的 `function_call` | 用 `id` 作为 tool call id |
-| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 时强制 `"none"` —— 共享网关拒绝 tools × effort 组合，且省略 effort 按非 none 处理 |
-| `temperature`、`top_p` | 同名——但 **gpt-6** 在推理开启时会被丢弃（该模型对非默认值一律 400），在关掉推理的两种形状里保留（带 `tools`，或显式 `reasoning_effort:"none"`） |
+| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 的回合会替换成该模型自己接受的值——luna 是 `"none"`，Sol 两个 id 是下限 `"low"`（它们拒收 `"none"`，也不接受省略） |
+| `temperature`、`top_p` | 同名；上游拒收的位置丢弃——luna 在推理开启时，Sol 两个 id 在所有带工具的回合 |
 | 顶层缺 `type` 的工具 `parameters` | 注入 `{"type":"object"}`（部分 provider 强制要求） |
 | `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
 | `input_text` / `output_text` / `summary_text` part | `{type:"text"}` part |
@@ -284,7 +287,7 @@ function 参数，并按模型族方言发 `max_completion_tokens` +
 | `reasoning` item | 丢弃（chat 侧无对应） |
 | `tools[]`（扁平结构） | `tools[]`（嵌套 `function` 对象） |
 | `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 归一化；Cursor 风格 `{"type":"none"}` 映射为字符串形式，`{"type":"tool"}` → `"required"`，`{"type":"function","name"}` 重新嵌套 |
-| `max_output_tokens` | `max_tokens`（**gpt-6** 用 `max_completion_tokens` —— 该模型只认这个字段名） |
+| `max_output_tokens` | `max_tokens`（**gpt-6** 用 `max_completion_tokens` —— 该族只认这个字段名） |
 | `temperature`、`top_p`、`parallel_tool_calls`、`user` | 同名 |
 | `response_format` / `text.format`（`json_schema`/`json_object`/`text`） | `response_format` |
 | `stream: true` | `stream: true` + `stream_options:{include_usage:true}` |
@@ -507,6 +510,80 @@ codex……）逐字节共用同一把凭据——上游按 token 计池时的�
 预算耗尽（或 passthrough 请求体无法缓冲重放）时，客户端收到 `429` +
 `Retry-After`——与排队拒绝同一契约——并保留上游的可读错误消息，让客户端
 SDK 的重试逻辑正常接管。
+
+### 渠道轮换类错误同样重试（共用同一预算）
+
+有些网关会把同一个模型轮换到多条上游渠道，而只有部分渠道为某种请求形状
+做过配置。2026-10-10 在共享网关上实测（`gpt-6.1-sol` + tools）：**同一个
+请求体**一分钟内 8/8 失败、几分钟后 20/20 成功，且 chat / responses /
+anthropic 三条路由同好同坏——请求没变，变的是它后面那条渠道。收到这类
+响应时，代理会**原样重发同一个 body**，退避与预算跟 429 共用，短窗口不会
+传到客户端。
+
+按上游文案**逐字匹配**（这是「渠道没配好」与「客户端参数真错了」的分界，
+后者重试只会同样失败）：
+
+- `requires /v1/responses or configured Chat-to-Responses routing`
+- `reasoning effort must be low, medium, high, xhigh, or max`
+- `Model resources are currently busy`
+- `Insufficient quota available for instant inference`
+
+只检查 400 与 503 的响应体，且只读前 4 KiB——**2xx 一律不碰**，它的响应体
+可能是还没结束的 SSE 流。想让这类错误原样透传给客户端，把
+`upstream_retry.enabled` 设为 `false`。
+
+### 会长时间坏掉的模型：失败记忆 + 可选替代模型
+
+轮换窗口可能远超任何合理的重试预算——2026-10-10 实测到的一个窗口持续了
+**15 分钟以上**，期间 `gpt-6.1-sol` + tools 无论换什么形状、哪条路由、哪个
+档位都失败（同一时段 `gpt-6-luna`、glm、claude、kimi 全部正常）。窗口内重试
+只是把同一个错误推迟几秒，所以代理改为**按模型记住失败**（`model_health`）：
+
+- 连续 `failure_threshold`（默认 2）次渠道轮换失败后，该模型在 `cooldown`
+  （默认 5m）内被标记为不可用；
+- 标记期间请求不再花重试预算，只打一次上游（这一击同时充当恢复探测），
+  任何一次成功立刻清除标记；
+- 冷却到期后进入**探测期**：只做一次**不重试**的原生尝试来判断上游是否恢复，
+  所以长窗口（2026-10-12 实测：1 小时 45 分仍在失败）每过一个冷却只多花几秒，
+  而不是每次都白等一整个重试预算；
+- 若 `model_health.fallbacks` 配了替代模型，标记期间由替代模型提供服务。
+  **默认为空**：没有显式配置就把上游错误原样交回，绝不会静默换模型。
+
+```yaml
+model_health:
+  failure_threshold: 2
+  cooldown: 5m
+  fallbacks: {}          # 例:{"gpt-6-sol": "gpt-6-luna", "gpt-6.1-sol": "gpt-6-luna"}
+```
+
+替代会写日志（`model marked unavailable; serving with its configured
+fallback`）并计数（`protocol_proxy_model_fallback_total{model=…}`）；
+标记/清除事件见 `protocol_proxy_model_unavailable_total{served_by=…}`。
+模型在网关侧彻底不可用是网关的问题，这一层只决定**本代理**在此期间怎么做。
+
+### 工具调用模拟（`tool_emulation`）
+
+上游确定不改时，代理可以自己把那层缺失的路由补上：模型被标记为不可用期间，
+**工具定义写进提示词**（配一套严格的 JSON 回复协议），工具历史重塑成纯文本，
+再把模型按协议回的载荷还原成真正的工具调用——客户端看到的仍是一个普通的
+工具调用回合。
+
+```yaml
+tool_emulation:
+  enabled: false                  # 需显式开启
+  models: ["gpt-6-sol", "gpt-6.1-sol"]   # 只对这些 id、且只在其被标记不可用期间生效
+```
+
+活网关上实测（2026-10-12，窗口内这两个 id 的原生工具调用 100% 失败时）：
+协议回复**4/4 可解析**，重塑历史里的第二轮工具调用同样可解析；完整走通
+Codex 形状的一轮（工具调用 → 工具结果 → 回答）与流式事件序列
+（`response.function_call_arguments.delta/done`），Anthropic 挂载上的
+Claude Code 形状同样走通。
+
+它不会做的事：不覆盖已配置的替代模型、不作用于名单外的 id、原生路径健康时
+完全不介入。代价是真实的——模型看到的是文本形式的工具而不是 API 的 `tools`
+——所以它是桥，不是常规路径。`protocol_proxy_tool_emulation_total{model=…}`
+统计接管次数，`protocol_proxy_tool_emulation_parsed_total` 统计解析成功的次数。
 
 ```yaml
 upstream_retry:
@@ -780,6 +857,13 @@ server:
 Codex 认为自己连的是真正的 Responses API，适配器在内部完成翻译。你的
 API Key 管理方式完全不变——Codex 发出的 `Authorization` header 原样转发
 到 upstream。
+
+这就是默认行为（`upstream.responses_mode: convert`），也是「上游自己的
+`/responses` 不完整」时唯一可用的形态——2026-10-10 在共享网关上实测：
+`/chat/completions` 对每个模型都能执行工具调用，而它的 `/responses` 从不
+执行（nested 工具形只回纯文本、扁平 Responses 形直接被拒），而 Codex 每个
+回合都带工具。这类网关请保持 `convert`；只有 provider 真正实现了 Responses
+（保留 reasoning item、服务端工具、store 语义）时才用 `passthrough`。
 
 ```toml
 model = "your-model"

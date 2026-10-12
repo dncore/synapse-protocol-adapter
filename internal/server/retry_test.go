@@ -44,7 +44,7 @@ func TestUpstreamRetry_AbsorbsThenSucceeds(t *testing.T) {
 	s := retryTestServer(fastRetryConfig())
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true, "",
 		func() (*http.Response, error) {
 			if calls.Add(1) < 3 {
 				return mkResp(429, "0", `{"detail":"too many"}`), nil
@@ -75,7 +75,7 @@ func TestUpstreamRetry_ExhaustsBudget(t *testing.T) {
 	s := retryTestServer(cfg)
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "", `{"detail":"too many"}`), nil
@@ -97,12 +97,13 @@ func TestUpstreamRetry_ExhaustsBudget(t *testing.T) {
 	}
 }
 
-func TestUpstreamRetry_OnlyRetries429(t *testing.T) {
+// 只有 429 与「渠道轮换」类错误会重试:普通 5xx 原样交回客户端。
+func TestUpstreamRetry_ServerErrorIsNotRetried(t *testing.T) {
 	var calls atomic.Int64
 	s := retryTestServer(fastRetryConfig())
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(500, "", "boom"), nil
@@ -125,7 +126,7 @@ func TestUpstreamRetry_DisabledPassthroughVerbatim(t *testing.T) {
 	s := retryTestServer(cfg)
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "", "verbatim"), nil
@@ -146,7 +147,7 @@ func TestUpstreamRetry_NonReplayableNotRetried(t *testing.T) {
 	s := retryTestServer(fastRetryConfig())
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", false,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", false, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "", "streamed body"), nil
@@ -172,7 +173,7 @@ func TestUpstreamRetry_BudgetStopsRetrying(t *testing.T) {
 	s := retryTestServer(cfg)
 
 	resp, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "", "too many"), nil
@@ -203,7 +204,7 @@ func TestUpstreamRetry_ContextCancelDuringBackoff(t *testing.T) {
 		cancel()
 	}()
 	_, err := s.doUpstreamRetry(ctx,
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "", "too many"), nil
@@ -225,7 +226,7 @@ func TestUpstreamRetry_RetryAfterClampedByMaxBackoff(t *testing.T) {
 
 	start := time.Now()
 	_, err := s.doUpstreamRetry(context.Background(),
-		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true,
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "",
 		func() (*http.Response, error) {
 			calls.Add(1)
 			return mkResp(429, "3600", "too many"), nil
@@ -443,5 +444,77 @@ func TestPassthrough_LargeBodyNotRetried(t *testing.T) {
 	}
 	if got := resp.Header.Get("Retry-After"); got != "1" {
 		t.Fatalf("Retry-After = %q, want synthesized 1", got)
+	}
+}
+
+// 网关在渠道间轮换:同一个请求体,部分渠道没配 chat→responses 路由,
+// 会回特定文案的 400/503。这类失败与客户端参数无关(实测同一形状
+// 8/8 失败 → 几分钟后 20/20 成功),所以代理按文案识别后原样重发。
+func TestUpstreamRetry_TransientChannelErrorIsRetried(t *testing.T) {
+	var bodies []string
+	s := retryTestServer(fastRetryConfig())
+
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true, "",
+		func() (*http.Response, error) {
+			bodies = append(bodies, "attempt")
+			if len(bodies) < 2 {
+				return mkResp(400, "", `{"detail":{"message":"GPT-6: gpt-6.1-sol tool calling requires /v1/responses or configured Chat-to-Responses routing"}}`), nil
+			}
+			return mkResp(200, "", "ok"), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 || len(bodies) != 2 {
+		t.Fatalf("want 200 after 2 attempts, got %d after %d", resp.StatusCode, len(bodies))
+	}
+	if got := s.metrics.RetriesAbsorbedTotal.Value(); got != 1 {
+		t.Fatalf("retry not counted: %d", got)
+	}
+}
+
+// 客户端自身参数错误的 400 不能重试:重试只会同样失败,白等一轮。
+func TestUpstreamRetry_ClientErrorIsNotRetried(t *testing.T) {
+	calls := 0
+	s := retryTestServer(fastRetryConfig())
+
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true, "",
+		func() (*http.Response, error) {
+			calls++
+			return mkResp(400, "", `{"detail":{"message":"Invalid 'messages[0]': expected a string"}}`), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 400 || calls != 1 {
+		t.Fatalf("client error must not be retried: status %d after %d calls", resp.StatusCode, calls)
+	}
+	// 错误体必须原样留给调用方
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "messages[0]") {
+		t.Fatalf("error body was consumed by the probe: %q", body)
+	}
+}
+
+// 持续坏窗口:重试到预算用尽后,把最后一次的上游响应原样交回。
+func TestUpstreamRetry_TransientErrorExhaustsBudget(t *testing.T) {
+	calls := 0
+	cfg := fastRetryConfig()
+	cfg.UpstreamRetry.MaxAttempts = 3
+	s := retryTestServer(cfg)
+
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "passthrough", true, "",
+		func() (*http.Response, error) {
+			calls++
+			return mkResp(503, "", `{"detail":{"message":"Model resources are currently busy."}}`), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 503 || calls != 3 {
+		t.Fatalf("want 503 after 3 attempts, got %d after %d", resp.StatusCode, calls)
 	}
 }

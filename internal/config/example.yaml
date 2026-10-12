@@ -107,6 +107,40 @@ upstream_retry:
                             # buffered so they can be replayed on retry;
                             # larger or chunked bodies stream (no retry)
 
+model_health:
+  # Per-model failure memory. The shared gateway rotates a model across
+  # upstream channels and only some channels serve every request shape, so the
+  # same request can fail for minutes and then work again (measured
+  # 2026-10-10 on gpt-6.1-sol + tools: 0/8 in one stretch, 20/20 minutes
+  # later, one window lasting 15+ minutes). Inside such a window the retry
+  # budget cannot succeed, so after `failure_threshold` consecutive
+  # channel-rotation failures the model is marked unavailable for `cooldown`;
+  # requests then make a single upstream attempt (the recovery probe) instead
+  # of burning the whole budget, and a success clears the mark immediately.
+  failure_threshold: 2
+  cooldown: 5m
+  # fallbacks maps a model id to the model that serves its requests while it
+  # is marked unavailable, e.g. {"gpt-6-sol": "gpt-6-luna"}. Empty (default):
+  # the upstream's error is passed through — the proxy never silently answers
+  # with a different model unless you configure the mapping yourself.
+  fallbacks: {}
+
+tool_emulation:
+  # Stand in for the upstream's missing "chat → responses routing". While a
+  # model is marked unavailable by model_health (its native tool calling is
+  # failing right now), tool calls are emulated instead of relayed as errors:
+  # the tools are described in the prompt, tool history is reframed as plain
+  # text, and a parseable protocol reply is turned back into a real tool call.
+  #
+  # This is a fidelity trade — the model sees tools as text — so it applies
+  # only to the ids listed here, only while they are marked unavailable, and
+  # never to a request that a configured fallback model already served.
+  # Measured on the live gateway inside a failure window (2026-10-12): the
+  # protocol reply parsed 4/4, and a second tool round inside the reframed
+  # history parsed as well. Leave enabled false to relay the upstream error.
+  enabled: false
+  models: []            # e.g. ["gpt-6-sol", "gpt-6.1-sol"]
+
 passthrough:
   # The transparent routes (/v1/*, /api/v1/*, /api/anthropic/*) forward
   # request bodies byte for byte. These switches are the deliberate

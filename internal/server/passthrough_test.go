@@ -606,3 +606,11 @@ func TestPassthrough_ModelQuirksLargeBodyStreamsUnrewritten(t *testing.T) {
 		t.Fatal("a body above max_rewrite_bytes must stream through unchanged")
 	}
 }
+
+// newTestServerWithConfig 与 newTestServer 相同,但用调用方给的配置(健康/回退等用例需要)。
+func newTestServerWithConfig(t *testing.T, upstreamURL string, cfg config.Config) *Server {
+	t.Helper()
+	cfg.Upstream.BaseURL = upstreamURL
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(cfg, logger, metrics.NewRegistry())
+}

@@ -243,12 +243,15 @@ and bodies — is streamed back byte-for-byte with a flush per read.
 The one opt-in exception is `passthrough.model_quirks`: with it enabled,
 bodies for model families whose API renamed or refuses a field the client
 sends are rewritten before forwarding — today the `gpt-6` family
-(`max_tokens` → `max_completion_tokens`, `reasoning_effort:"none"` injected
-whenever tools are present, `temperature`/`top_p` dropped while reasoning is
-on, and on the Anthropic mount also `thinking` dropped and `max_tokens`
-renamed). Every other body — including every other model — still goes
-through untouched, and bodies above `passthrough.max_rewrite_bytes` are
-forwarded unchanged.
+(`max_tokens` → `max_completion_tokens`, a tool-bearing turn forced onto an
+explicit `reasoning_effort` the model accepts, `temperature`/`top_p` dropped
+where the upstream refuses them, and on the Anthropic mount also `thinking`
+dropped and `max_tokens` renamed). The rules are **per model, not per
+family**: the Sol ids reject `"none"` outright and refuse sampling on tool
+turns, while luna keeps the older "tools ⇒ none" shape — see
+`internal/converter/modelcaps.go` for the dated measurements. Every other
+body — including every other model — still goes through untouched, and
+bodies above `passthrough.max_rewrite_bytes` are forwarded unchanged.
 
 This means one port speaks both protocols: Responses clients hit
 `/v1/responses` (converted), native chat-completions clients hit
@@ -275,9 +278,9 @@ request and never sends `reasoning_effort`, which the model rejects with
 (and only those) the proxy translates Anthropic ⇄ Chat itself: `system`
 blocks become a system message, text/image/tool_use/tool_result blocks become
 chat content and `tool_calls`, `tools[].input_schema` becomes nested function
-parameters, the family dialect applies (`max_completion_tokens`,
-`reasoning_effort:"none"`), and the answer is re-emitted as Anthropic content
-blocks and SSE events (tool arguments as `input_json_delta`).
+parameters, the per-model dialect applies (`max_completion_tokens`, the
+model's own accepted `reasoning_effort`), and the answer is re-emitted as
+Anthropic content blocks and SSE events (tool arguments as `input_json_delta`).
 Everything else — other models, tool-free turns, `count_tokens`, other
 endpoints — keeps going through the upstream untouched, and a body shape the
 mapper does not fully understand falls back to plain passthrough rather than
@@ -298,8 +301,8 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `developer` role messages | normalized to `system` (semantically identical, universally accepted) |
 | consecutive `function_call` items (parallel calls) | merged into ONE assistant message with N `tool_calls` |
 | `function_call` with only `id`, no `call_id` | `id` used as the tool call id |
-| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); with `tools` on **gpt-6** it is forced to `"none"` — the shared gateway rejects tools × effort, and an omitted effort counts as non-none |
-| `temperature`, `top_p` | same names — but on **gpt-6** they are dropped while reasoning is on (that model answers 400 for any value other than the default there) and kept in the shapes that turn reasoning off (tools present, or an explicit `reasoning_effort:"none"`) |
+| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); on a **gpt-6** tool-bearing turn it is replaced by the model's own accepted value — `"none"` on luna, the floor `"low"` on the Sol ids, which reject `"none"` and refuse an omitted effort |
+| `temperature`, `top_p` | same names; dropped where the upstream refuses them — luna while reasoning is on, the Sol ids on every tool-bearing turn |
 | tool `parameters` without top-level `type` | `{"type":"object"}` injected (several providers require it) |
 | `input[]` `message` items | messages (`system`/`developer`/`user`/`assistant` roles pass through) |
 | `input_text` / `output_text` / `summary_text` parts | `{type:"text"}` parts |
@@ -310,7 +313,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `reasoning` items | dropped (no chat equivalent) |
 | `tools[]` (flattened) | `tools[]` (nested `function` object) |
 | `tool_choice` (`"auto"`/`"none"`/`"required"` or object form) | normalized; Cursor-style `{"type":"none"}` etc. map to their string forms, `{"type":"tool"}` → `"required"`, `{"type":"function","name"}` re-nested |
-| `max_output_tokens` | `max_tokens` (**gpt-6**: `max_completion_tokens` — the only name that model accepts) |
+| `max_output_tokens` | `max_tokens` (**gpt-6**: `max_completion_tokens` — the only name that family accepts) |
 | `temperature`, `top_p`, `parallel_tool_calls`, `user` | same names |
 | `response_format` / `text.format` (`json_schema`/`json_object`/`text`) | `response_format` |
 | `stream: true` | `stream: true` + `stream_options:{include_usage:true}` |
@@ -545,6 +548,97 @@ user-queue and global slots, so the backoff applies backpressure rather
 than more pressure — the queue drains slower during a storm, by design.
 Only 429 is retried, and only before any byte reached the client: once a
 200 starts streaming, the response is committed.
+
+### Channel-rotation errors are retried too (same budget)
+
+Some gateways rotate a model across several upstream channels, and only
+some channels are provisioned for a given request shape. Measured
+2026-10-10 on the shared gateway with `gpt-6.1-sol` + tools: one minute the
+identical request failed 8/8, minutes later it succeeded 20/20, on every
+route (chat / responses / anthropic) alike — the same body, a different
+channel behind it. When such a response arrives, the proxy re-sends the
+**identical** body under the same backoff/budget as a 429, so a short
+rotation window never reaches the client.
+
+The retried bodies are matched verbatim (they are what separates a
+rotated-away channel from a real client mistake, which must not be
+retried):
+
+- `requires /v1/responses or configured Chat-to-Responses routing`
+- `reasoning effort must be low, medium, high, xhigh, or max`
+- `Model resources are currently busy`
+- `Insufficient quota available for instant inference`
+
+Only 400 and 503 responses are inspected, and only their first 4 KiB — a
+successful response is never touched, because its body may be an open SSE
+stream. Set `upstream_retry.enabled: false` to relay such errors verbatim
+instead.
+
+### Models that stay broken: failure memory + optional fallback
+
+A rotation window can outlast any sane retry budget — the one measured on
+2026-10-10 ran for **15+ minutes**, during which every attempt for
+`gpt-6.1-sol` + tools failed no matter the shape, the route or the effort
+(`gpt-6-luna`, glm, claude and kimi answered normally in the same minutes).
+Retrying inside such a window only delays the same error, so the proxy
+remembers it per model instead (`model_health`):
+
+- after `failure_threshold` consecutive channel-rotation failures (default 2)
+  the model is marked unavailable for `cooldown` (default 5m);
+- while marked, requests skip the retry budget and make a single upstream
+  attempt — which doubles as the recovery probe — and any success clears the
+  mark immediately;
+- once the cooldown expires the model enters probation: exactly **one**
+  un-retried native attempt decides whether the upstream recovered, so a
+  long window (measured 2026-10-12: 1h45m and still failing) costs a few
+  seconds per cooldown instead of a full retry budget each time;
+- if `model_health.fallbacks` maps the model to another one, requests are
+  served by that model while it is marked. **Empty by default**: without an
+  explicit mapping the upstream's error is passed through, never a silently
+  different model.
+
+```yaml
+model_health:
+  failure_threshold: 2
+  cooldown: 5m
+  fallbacks: {}          # e.g. {"gpt-6-sol": "gpt-6-luna", "gpt-6.1-sol": "gpt-6-luna"}
+```
+
+Substitutions are logged (`model marked unavailable; serving with its
+configured fallback`) and counted
+(`protocol_proxy_model_fallback_total{model=…}`); mark/unmark events appear as
+`protocol_proxy_model_unavailable_total{served_by=…}`. A model the gateway
+cannot serve at all is a gateway-side problem: this layer only decides what
+*this* proxy does in the meantime.
+
+### Tool-call emulation (`tool_emulation`)
+
+When the upstream defers fixing its side, the proxy can stand in for the
+missing routing instead of waiting: while a model is marked unavailable, the
+tools are described **in the prompt** (strict JSON reply protocol), tool
+history is reframed as plain text, and a parseable reply is turned back into
+a real tool call — so the client sees an ordinary tool-calling turn.
+
+```yaml
+tool_emulation:
+  enabled: false                  # opt-in
+  models: ["gpt-6-sol", "gpt-6.1-sol"]   # only these ids, and only while marked unavailable
+```
+
+Measured on the live gateway inside a failure window (2026-10-12, native tool
+calling failing 100% for those ids at that moment): the protocol reply parsed
+**4/4**, a second tool round inside the reframed history parsed as well, and a
+full Codex-shaped exchange (tool call → tool result → answer) plus the
+streaming event sequence (`response.function_call_arguments.delta/done`)
+completed through the proxy — as did the same exchange on the Anthropic mount
+for Claude Code.
+
+What it is not: it never overrides a configured fallback, it never applies to
+ids that are not listed, and it leaves the request untouched whenever the
+native path is healthy. The fidelity cost is real — the model sees tools as
+text rather than as the API's `tools` — so treat it as the bridge it is.
+`protocol_proxy_tool_emulation_total{model=…}` counts takeover requests and
+`protocol_proxy_tool_emulation_parsed_total` the replies that yielded a call.
 
 When the budget runs out (or a passthrough body could not be buffered for
 replay), the client gets `429` plus `Retry-After` — the same contract as
@@ -842,6 +936,14 @@ Notes:
 Codex believes it is talking to a real Responses API; the adapter
 translates internally. Your API key handling stays exactly as it is — the
 `Authorization` header Codex sends is forwarded upstream unchanged.
+
+This is the default (`upstream.responses_mode: convert`) and it is what makes
+Codex work against upstreams whose own `/responses` is incomplete — measured
+2026-10-10 on the shared gateway: `/chat/completions` executes tool calls for
+every model, while its `/responses` never does (nested tool definitions come
+back as plain text, the flattened Responses shape is rejected outright), and
+Codex sends tools on every turn. Keep `convert` for such a gateway; use
+`passthrough` only when the provider implements Responses properly.
 
 ```toml
 model = "your-model"

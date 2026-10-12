@@ -34,6 +34,10 @@ type Registry struct {
 	PassthroughRewritesTotal *LabeledCounter
 	AnthropicTakeoverTotal   *Counter
 	AnthropicFallbackTotal   *LabeledCounter
+	ModelUnavailableTotal    *LabeledCounter
+	ModelFallbackTotal       *LabeledCounter
+	ToolEmulationTotal       *LabeledCounter
+	ToolEmulationParsedTotal *Counter
 
 	// Gauges.
 	ActiveConnections *Gauge
@@ -69,6 +73,10 @@ func NewRegistry() *Registry {
 		PassthroughRewritesTotal: &LabeledCounter{Name: "protocol_proxy_passthrough_rewrites_total", Help: "Passthrough request bodies rewritten by the model-quirk normalizer, by rule.", Label: "rule"},
 		AnthropicTakeoverTotal:   &Counter{Name: "protocol_proxy_anthropic_takeover_total", Help: "Anthropic-mount requests elected for local translation (upstream.anthropic_mode=gpt6-tools); see the fallback counter for candidates that were handed back."},
 		AnthropicFallbackTotal:   &LabeledCounter{Name: "protocol_proxy_anthropic_fallback_total", Help: "Anthropic-mount takeover candidates handed back to passthrough, by reason.", Label: "reason"},
+		ModelUnavailableTotal:    &LabeledCounter{Name: "protocol_proxy_model_unavailable_total", Help: "Requests served while the model was marked unavailable after repeated channel-rotation failures (single attempt, no retry budget); excludes emulated and fallback-substituted requests, which have their own counters.", Label: "served_by"},
+		ModelFallbackTotal:       &LabeledCounter{Name: "protocol_proxy_model_fallback_total", Help: "Requests whose model id was replaced by a configured fallback because the original was marked unavailable.", Label: "model"},
+		ToolEmulationTotal:       &LabeledCounter{Name: "protocol_proxy_tool_emulation_total", Help: "Requests whose tools were moved into the prompt because the upstream's native tool calling was unavailable, by model.", Label: "model"},
+		ToolEmulationParsedTotal: &Counter{Name: "protocol_proxy_tool_emulation_parsed_total", Help: "Emulated replies that carried a parseable tool call."},
 
 		ActiveConnections: &Gauge{Name: "protocol_proxy_active_connections", Help: "Currently open client connections."},
 		ActiveRequests:    &Gauge{Name: "protocol_proxy_active_requests", Help: "Requests currently being proxied."},
@@ -195,6 +203,7 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeCounter(r.QueuedRequestsTotal, "")
 	writeCounter(r.RetriesAbsorbedTotal, "")
 	writeCounter(r.RetryExhaustedTotal, "")
+	writeCounter(r.ToolEmulationParsedTotal, "")
 	writeCounter(r.AnthropicTakeoverTotal, "")
 
 	writeLabeled := func(lc *LabeledCounter) {
@@ -219,6 +228,9 @@ func (r *Registry) WriteText(sb *strings.Builder) {
 	writeLabeled(r.QueueRejectedTotal)
 	writeLabeled(r.PassthroughRewritesTotal)
 	writeLabeled(r.AnthropicFallbackTotal)
+	writeLabeled(r.ModelUnavailableTotal)
+	writeLabeled(r.ModelFallbackTotal)
+	writeLabeled(r.ToolEmulationTotal)
 	writeLabeled(r.Upstream429Total)
 
 	writeGauge := func(g *Gauge) {

@@ -5,6 +5,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -48,6 +49,10 @@ type Server struct {
 	sem     chan struct{}
 	// userReg gates requests per API key; nil when users.enabled is false.
 	userReg *users.Registry
+	// health remembers per-model channel-rotation failures so a model the
+	// gateway cannot currently serve fails fast instead of burning the retry
+	// budget on every request (see modelhealth.go).
+	health  *modelHealth
 	httpSrv *http.Server
 	// tlsCert is the currently served certificate; swapped atomically on
 	// SIGHUP so GetCertificate always hands out a consistent one.
@@ -72,6 +77,7 @@ func New(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) *Server 
 		client:  upstream.NewClient(cfg),
 		sem:     newSemaphore(cfg.Limits.MaxConcurrency),
 		userReg: userReg,
+		health:  newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown),
 	}
 	for _, w := range cfg.Warnings() {
 		logger.Warn(w)
@@ -556,11 +562,48 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-request lifetime. This context is the cancellation pipeline:
+	// client disconnect (r.Context) or request timeout aborts the upstream
+	// call; a mid-stream client write failure cancels it explicitly.
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeouts.Request)
+	defer cancel()
+
+	// A model the gateway has been failing may have a configured fallback.
+	// Substitution happens BEFORE the conversion: the converted body carries
+	// the model id, so rewriting it afterwards would leave the upstream call
+	// on the failing model. Opt-in: empty map = never.
+	hasTools := len(req.Tools) > 0
+	substituted := false
+	if sub, ok := s.substitutedModel(req.Model, hasTools); ok {
+		s.metrics.ModelFallbackTotal.With(req.Model).Inc()
+		s.logger.Warn("model marked unavailable; serving with its configured fallback",
+			"request_id", middleware.RequestIDOf(r), "from", req.Model, "to", sub)
+		req.Model = sub
+		substituted = true
+	}
+
 	chatReq, err := converter.ConvertRequest(&req)
 	if err != nil {
 		s.writeProxyError(w, http.StatusBadRequest, err.Error())
 		s.metrics.ErrorsTotal.With("bad_request").Inc()
 		return
+	}
+
+	// No fallback configured for a model whose native tool calling is known
+	// to be failing: carry the tools in the prompt instead (opt-in). The
+	// upstream call becomes non-streaming, because the protocol reply has to
+	// be complete before it can be parsed.
+	emulating := false
+	if !substituted && s.shouldEmulate(req.Model, hasTools) {
+		if converter.EmulateToolProtocol(chatReq) {
+			emulating = true
+			chatReq.Stream = false
+			chatReq.StreamOptions = nil
+			s.metrics.ToolEmulationTotal.With(req.Model).Inc()
+			s.logger.Warn("emulating tool calls in the prompt (upstream tool calling unavailable)",
+				"request_id", middleware.RequestIDOf(r), "model", req.Model,
+				"tools", len(req.Tools))
+		}
 	}
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
@@ -569,20 +612,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-request lifetime. This context is the cancellation pipeline:
-	// client disconnect (r.Context) or request timeout aborts the upstream
-	// call; a mid-stream client write failure cancels it explicitly.
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeouts.Request)
-	defer cancel()
-
 	upStart := time.Now()
 	// The converted body is already in memory, so the attempt is always
 	// replayable: a transient upstream 429 is absorbed with bounded
 	// retries while this request keeps its queue and global slots.
 	attempt := func() (*http.Response, error) {
-		return s.client.Do(ctx, chatBody, r.Header, req.Stream)
+		return s.client.Do(ctx, chatBody, r.Header, req.Stream && !emulating)
 	}
-	resp, err := s.doUpstreamRetry(ctx, r, "convert", true, attempt)
+	// Emulated requests are not health-tracked: their success is our own
+	// prompting, not evidence that the upstream's tool calling recovered.
+	healthModel := healthKey(req.Model, hasTools)
+	if emulating {
+		healthModel = ""
+	}
+	resp, err := s.doUpstreamRetry(ctx, r, "convert", true, healthModel, attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -612,12 +655,67 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if emulating {
+		s.respondEmulated(w, r, ctx, cancel, resp, &req, start)
+		return
+	}
 	if req.Stream {
 		s.metrics.StreamingRequests.Inc()
 		s.streamResponse(w, r, ctx, cancel, resp, &req, start)
 	} else {
 		s.encodedResponse(w, resp, &req, start)
 	}
+}
+
+// respondEmulated parses the protocol reply of an emulated request, converts
+// a parsed tool call into a real one, and then travels the ordinary response
+// paths — synthesized as chat SSE when the client asked for a stream, so the
+// existing transformers do the rest.
+func (s *Server) respondEmulated(w http.ResponseWriter, r *http.Request, ctx context.Context, cancel context.CancelFunc, resp *http.Response, req *responses.Request, start time.Time) {
+	body, err := upstream.ReadAllWithLimit(resp.Body, int64(s.cfg.Limits.MaxBodyBytes))
+	if err != nil {
+		s.writeProxyError(w, http.StatusBadGateway, "upstream response unreadable or too large")
+		s.metrics.UpstreamErrorsTotal.With("body_read").Inc()
+		return
+	}
+	_ = resp.Body.Close()
+
+	var chat completions.Response
+	if err := json.Unmarshal(body, &chat); err != nil {
+		s.writeProxyError(w, http.StatusBadGateway, "upstream returned malformed JSON")
+		s.metrics.UpstreamErrorsTotal.With("malformed_json").Inc()
+		return
+	}
+
+	if len(chat.Choices) > 0 {
+		content := chat.Choices[0].Message.Content.String
+		if name, args, ok := converter.ParseEmulatedToolCall(content); ok {
+			id := emulatedCallID()
+			if converter.ApplyEmulatedToolCall(&chat, id, name, args) {
+				s.metrics.ToolEmulationParsedTotal.Inc()
+				s.logger.Info("emulated tool call parsed from the model's reply",
+					"request_id", middleware.RequestIDOf(r), "model", req.Model,
+					"tool", name, "call_id", id)
+			}
+		} else if strings.TrimSpace(content) == "" {
+			// A protocol reply that is neither a tool call nor text would
+			// otherwise reach the client as an empty turn; say so instead.
+			s.logger.Warn("emulated reply carried neither a tool call nor text",
+				"request_id", middleware.RequestIDOf(r), "model", req.Model)
+		}
+	}
+
+	if req.Stream {
+		s.metrics.StreamingRequests.Inc()
+		synth := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(bytes.NewReader(converter.SynthesizeChatSSE(&chat))),
+		}
+		s.streamResponse(w, r, ctx, cancel, synth, req, start)
+		return
+	}
+	s.writeConvertedResponse(w, &chat, resp, req, start)
 }
 
 // encodedResponse handles the non-streaming path.
@@ -636,7 +734,14 @@ func (s *Server) encodedResponse(w http.ResponseWriter, resp *http.Response, req
 		return
 	}
 
-	out := converter.ConvertResponse(&chat, req)
+	s.writeConvertedResponse(w, &chat, resp, req, start)
+}
+
+// writeConvertedResponse converts a complete chat response into the Responses
+// shape and writes it (the non-streaming half of both the ordinary and the
+// emulated paths).
+func (s *Server) writeConvertedResponse(w http.ResponseWriter, chat *completions.Response, resp *http.Response, req *responses.Request, start time.Time) {
+	out := converter.ConvertResponse(chat, req)
 	outJSON, err := json.Marshal(out)
 	if err != nil {
 		s.writeProxyError(w, http.StatusInternalServerError, "internal conversion error")

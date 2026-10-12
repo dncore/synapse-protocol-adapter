@@ -11,6 +11,7 @@ import (
 
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
+	"github.com/dncore/synapse-protocol-adapter/internal/middleware"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
 
@@ -68,6 +69,18 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A model the gateway has been failing may have a configured fallback;
+	// the substitution rides the same rewrite gate as the quirk rules (the
+	// route's byte-for-byte promise, and this one exception to it).
+	if buffered != nil && s.cfg.Passthrough.ModelQuirks {
+		if rewritten, from, to := s.substituteUnavailableModel(buffered); to != "" {
+			s.metrics.ModelFallbackTotal.With(from).Inc()
+			s.logger.Warn("model marked unavailable; serving with its configured fallback",
+				"request_id", middleware.RequestIDOf(r), "from", from, "to", to)
+			buffered = rewritten
+		}
+	}
+
 	// Anthropic-mount takeover: only the requests the upstream's own
 	// translator cannot serve are translated locally (see anthropic.go). A
 	// candidate that turns out unsupported falls back to the passthrough
@@ -100,7 +113,11 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		return s.client.DoPassthrough(ctx, r.Method,
 			stripAPIPrefix(r.URL.Path), r.URL.RawQuery, body, r.Header)
 	}
-	resp, err := s.doUpstreamRetry(ctx, r, "passthrough", buffered != nil, attempt)
+	// The model and shape are read off the (possibly rewritten) body purely
+	// for the per-model health bookkeeping; an unparsable body just means
+	// "unknown".
+	model, hasTools := bodyModelShape(buffered)
+	resp, err := s.doUpstreamRetry(ctx, r, "passthrough", buffered != nil, healthKey(model, hasTools), attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()

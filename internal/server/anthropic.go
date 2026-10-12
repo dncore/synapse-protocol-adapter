@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/dncore/synapse-protocol-adapter/internal/completions"
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/converter"
+	"github.com/dncore/synapse-protocol-adapter/internal/middleware"
 	"github.com/dncore/synapse-protocol-adapter/internal/streaming"
 	"github.com/dncore/synapse-protocol-adapter/internal/upstream"
 )
@@ -61,10 +63,36 @@ func (s *Server) anthropicTakeover(path string, body []byte) *anthropic.Request 
 // caller to fall back to passthrough (the client then sees exactly what it
 // would have seen without the takeover).
 func (s *Server) handleAnthropicTakeover(w http.ResponseWriter, r *http.Request, req *anthropic.Request, start time.Time) bool {
+	// Substitution before conversion: the converted body carries the model id.
+	hasTools := len(req.Tools) > 0
+	substituted := false
+	if sub, ok := s.substitutedModel(req.Model, hasTools); ok {
+		s.metrics.ModelFallbackTotal.With(req.Model).Inc()
+		s.logger.Warn("model marked unavailable; serving with its configured fallback",
+			"request_id", middleware.RequestIDOf(r), "from", req.Model, "to", sub)
+		req.Model = sub
+		substituted = true
+	}
+
 	chatReq, err := anthropic.ConvertRequest(req)
 	if err != nil {
 		s.metrics.AnthropicFallbackTotal.With(fallbackReason(err)).Inc()
 		return false
+	}
+
+	// Same emulation as the Responses route: while this model's native tool
+	// calling is failing, carry the tools in the prompt and parse the reply
+	// back into a real tool call (see internal/converter/emulate.go).
+	emulating := false
+	if !substituted && s.shouldEmulate(req.Model, hasTools) {
+		if converter.EmulateToolProtocol(chatReq) {
+			emulating = true
+			chatReq.Stream = false
+			chatReq.StreamOptions = nil
+			s.metrics.ToolEmulationTotal.With(req.Model).Inc()
+			s.logger.Warn("emulating tool calls in the prompt (upstream tool calling unavailable)",
+				"request_id", middleware.RequestIDOf(r), "model", req.Model, "tools", len(req.Tools))
+		}
 	}
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
@@ -88,9 +116,13 @@ func (s *Server) handleAnthropicTakeover(w http.ResponseWriter, r *http.Request,
 		}
 	}
 	attempt := func() (*http.Response, error) {
-		return s.client.Do(ctx, chatBody, headers, req.Stream)
+		return s.client.Do(ctx, chatBody, headers, req.Stream && !emulating)
 	}
-	resp, err := s.doUpstreamRetry(ctx, r, harness.logLabel(), true, attempt)
+	healthModel := healthKey(harness.req.Model, hasTools)
+	if emulating {
+		healthModel = "" // 模拟成功不算上游工具调用恢复
+	}
+	resp, err := s.doUpstreamRetry(ctx, r, harness.logLabel(), true, healthModel, attempt)
 	if err != nil {
 		s.metrics.UpstreamErrorsTotal.With(classifyUpstreamError(err)).Inc()
 		s.metrics.ErrorsTotal.With("upstream").Inc()
@@ -124,6 +156,9 @@ func (s *Server) handleAnthropicTakeover(w http.ResponseWriter, r *http.Request,
 		return true
 	}
 
+	if emulating {
+		return s.respondAnthropicEmulated(w, r, ctx, cancel, harness, resp)
+	}
 	if req.Stream {
 		s.metrics.StreamingRequests.Inc()
 		harness.stream(w, r, ctx, cancel, resp)
@@ -159,7 +194,13 @@ func (h *anthropicTakeoverHarness) encoded(w http.ResponseWriter, resp *http.Res
 		h.s.metrics.UpstreamErrorsTotal.With("malformed_json").Inc()
 		return
 	}
-	out := anthropic.ConvertResponse(&chat, h.req.Model)
+	h.writeConverted(w, &chat, resp)
+}
+
+// writeConverted renders a complete chat response as Anthropic, for both the
+// ordinary non-streaming path and the emulated one.
+func (h *anthropicTakeoverHarness) writeConverted(w http.ResponseWriter, chat *completions.Response, resp *http.Response) {
+	out := anthropic.ConvertResponse(chat, h.req.Model)
 	outJSON, err := json.Marshal(out)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal conversion error")
@@ -172,6 +213,49 @@ func (h *anthropicTakeoverHarness) encoded(w http.ResponseWriter, resp *http.Res
 	h.s.metrics.BytesOutTotal.Add(int64(n))
 	h.s.metrics.ResponsesTotal.Inc()
 	h.s.metrics.RequestDuration.Observe(time.Since(h.start).Seconds())
+}
+
+// respondAnthropicEmulated mirrors respondEmulated for the Anthropic mount:
+// parse the protocol reply, turn it into a real tool call, then travel the
+// ordinary Anthropic response paths (synthesized chat SSE when streaming).
+func (s *Server) respondAnthropicEmulated(w http.ResponseWriter, r *http.Request, ctx context.Context, cancel context.CancelFunc, h *anthropicTakeoverHarness, resp *http.Response) bool {
+	body, err := upstream.ReadAllWithLimit(resp.Body, int64(s.cfg.Limits.MaxBodyBytes))
+	if err != nil {
+		h.writeError(w, http.StatusBadGateway, "upstream response unreadable or too large")
+		s.metrics.UpstreamErrorsTotal.With("body_read").Inc()
+		return true
+	}
+	_ = resp.Body.Close()
+
+	var chat completions.Response
+	if err := json.Unmarshal(body, &chat); err != nil {
+		h.writeError(w, http.StatusBadGateway, "upstream returned malformed JSON")
+		s.metrics.UpstreamErrorsTotal.With("malformed_json").Inc()
+		return true
+	}
+	if len(chat.Choices) > 0 {
+		content := chat.Choices[0].Message.Content.String
+		if name, args, ok := converter.ParseEmulatedToolCall(content); ok {
+			id := emulatedCallID()
+			if converter.ApplyEmulatedToolCall(&chat, id, name, args) {
+				s.metrics.ToolEmulationParsedTotal.Inc()
+				s.logger.Info("emulated tool call parsed from the model's reply",
+					"request_id", middleware.RequestIDOf(r), "model", h.req.Model, "tool", name, "call_id", id)
+			}
+		}
+	}
+	if h.req.Stream {
+		s.metrics.StreamingRequests.Inc()
+		synth := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(bytes.NewReader(converter.SynthesizeChatSSE(&chat))),
+		}
+		h.stream(w, r, ctx, cancel, synth)
+		return true
+	}
+	h.writeConverted(w, &chat, resp)
+	return true
 }
 
 // stream pumps the chat SSE stream, emitting Anthropic events per chunk.

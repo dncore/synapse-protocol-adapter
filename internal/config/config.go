@@ -33,6 +33,8 @@ type Config struct {
 	Limits        Limits        `yaml:"limits"`
 	Users         Users         `yaml:"users"`
 	UpstreamRetry UpstreamRetry `yaml:"upstream_retry"`
+	ModelHealth   ModelHealth   `yaml:"model_health"`
+	ToolEmulation ToolEmulation `yaml:"tool_emulation"`
 	Passthrough   Passthrough   `yaml:"passthrough"`
 	Timeouts      Timeouts      `yaml:"timeouts"`
 	Shutdown      Shutdown      `yaml:"shutdown"`
@@ -43,6 +45,51 @@ type Config struct {
 // /api/anthropic/*). Their contract is to forward requests byte for byte;
 // the switches here are the deliberate exceptions, each one a fix for a
 // client shape the configured upstream rejects.
+// ModelHealth remembers per-model upstream failures so a model the gateway
+// cannot currently serve stops burning the retry budget on every request,
+// and (optionally) is replaced by a configured fallback model.
+//
+// Background: the shared gateway rotates a model across upstream channels and
+// only some of them serve every request shape. Measured 2026-10-10 with
+// gpt-6.1-sol + tools: identical requests failed 0/8 in one stretch, then
+// succeeded 20/20 minutes later, with one live failure window lasting at
+// least 15 minutes. Retrying within such a window cannot succeed, so the
+// proxy stops trying after `failure_threshold` consecutive channel-rotation
+// failures and re-probes once per request during `cooldown`.
+//
+// Fallbacks are opt-in and empty by default: with none configured, requests
+// for an unavailable model fail fast with the upstream's own error instead of
+// being served by a different model without the caller asking.
+type ModelHealth struct {
+	// FailureThreshold is how many consecutive channel-rotation failures mark
+	// a model unavailable. Default 2.
+	FailureThreshold int `yaml:"failure_threshold"`
+	// Cooldown is how long the mark lasts. Each request during it still makes
+	// one upstream attempt (the recovery probe) but skips the retry budget.
+	// Default 5m.
+	Cooldown time.Duration `yaml:"cooldown"`
+	// Fallbacks maps a model id to the model that serves its requests while it
+	// is marked unavailable, e.g. {"gpt-6-sol": "gpt-6-luna"}. Keys are matched
+	// case-insensitively. Empty (the default) means "do not substitute".
+	Fallbacks map[string]string `yaml:"fallbacks"`
+}
+
+// ToolEmulation lets the proxy stand in for the upstream's missing
+// "chat → responses routing": while a model is marked unavailable by
+// model_health (i.e. its native tool calling is failing), the tools are
+// described in the prompt instead of the `tools` field and the model's reply
+// is parsed back into a real tool call.
+//
+// This is a fidelity trade: the model sees tools as text, so it is only used
+// for the ids listed here and only while those ids are failing. Leave
+// `enabled` false (the default) to relay the upstream error instead.
+type ToolEmulation struct {
+	Enabled bool `yaml:"enabled"`
+	// Models lists the ids emulation may apply to, e.g.
+	// ["gpt-6-sol", "gpt-6.1-sol"]. Empty means "never".
+	Models []string `yaml:"models"`
+}
+
 type Passthrough struct {
 	// ModelQuirks rewrites request bodies for model families whose API
 	// renamed or rejected a field the client sends (currently the gpt-6
@@ -258,6 +305,10 @@ func Defaults() Config {
 			MaxBackoff:     15 * time.Second,
 			Budget:         60 * time.Second,
 			BufferMaxBytes: 4 << 20, // 4 MiB: LLM JSON bodies fit; media uploads stream
+		},
+		ModelHealth: ModelHealth{
+			FailureThreshold: 2,
+			Cooldown:         5 * time.Minute,
 		},
 		Passthrough: Passthrough{
 			ModelQuirks:     false,

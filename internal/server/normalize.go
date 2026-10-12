@@ -14,15 +14,17 @@ import (
 // deliberate exception, gated behind passthrough.model_quirks. It touches
 // only the model families whose upstream refuses the shape a client sends —
 // today the gpt-6 family on the shared gateway, where the following are
-// measured facts (2026-09-30, live gateway):
+// measured facts (2026-10-10, live gateway; per-model detail in
+// internal/converter/modelcaps.go):
 //
 //   - `max_tokens` is rejected ("Use 'max_completion_tokens' instead");
 //     sending both fields is rejected too, so the rename replaces it.
-//   - function tools together with `reasoning_effort` are rejected, and an
-//     omitted effort counts as non-none — a tools request must send "none".
-//   - `temperature`/`top_p` are rejected while reasoning is on ("does not
-//     support 0.7 with this model. Only the default (1) value is supported")
-//     but accepted once the effort is "none".
+//   - a tool-bearing request must carry an explicit `reasoning_effort` from
+//     the model's own accepted set, and must not carry temperature/top_p:
+//     the Sol ids reject "none" outright and 400 (4/4) on any sampling
+//     parameter, and an omitted effort is not reliable either.
+//   - luna keeps the older shape (tools ⇒ explicit "none") because that is
+//     the only value that was observed to work on every channel for it.
 //   - on the Anthropic mount the body carries max_tokens (mandatory there)
 //     and clients may send `thinking`; the upstream forwards both into the
 //     chat request, which the model then rejects. Neither can be expressed
@@ -31,8 +33,8 @@ import (
 //     this rewriter.
 //
 // The converter's dialect rules (internal/converter/request.go) implement
-// the same family behavior for the /responses route, which builds a typed
-// request instead of editing raw JSON.
+// the same behavior for the /responses route, which builds a typed request
+// instead of editing raw JSON.
 
 // rewriteRules names the rules a request triggered, for metrics labels.
 const (
@@ -62,7 +64,7 @@ func normalizeModelQuirks(path string, body []byte) (out []byte, rules []string)
 	case isAnthropicMessagesPath(path):
 		rules = normalizeAnthropic(doc)
 	case isChatCompletionsPath(path):
-		rules = normalizeChat(doc)
+		rules = normalizeChat(model, doc)
 	}
 	if len(rules) == 0 {
 		return body, nil
@@ -78,7 +80,7 @@ func normalizeModelQuirks(path string, body []byte) (out []byte, rules []string)
 }
 
 // normalizeChat applies the chat-completions rules in place.
-func normalizeChat(doc map[string]json.RawMessage) []string {
+func normalizeChat(model string, doc map[string]json.RawMessage) []string {
 	var rules []string
 
 	// max_tokens → max_completion_tokens. The rename replaces the field:
@@ -97,16 +99,24 @@ func normalizeChat(doc map[string]json.RawMessage) []string {
 	}
 	hasTools := hasNonEmptyArray(doc["tools"])
 
-	// With tools the only accepted effort is "none" — the gateway reads an
-	// omitted effort as non-none, so it must be sent explicitly.
-	if hasTools && effort != "none" {
-		doc["reasoning_effort"] = json.RawMessage(`"none"`)
-		effort = "none"
+	// The shape decision belongs to the converter: it knows each model's
+	// accepted effort set (tools ⇒ an explicit value from that set, no tools
+	// ⇒ keep an accepted value, drop a rejected one).
+	effective := converter.NormalizeGPT6Effort(model, effort, hasTools)
+	if effective != effort {
+		if effective == "" {
+			delete(doc, "reasoning_effort")
+		} else {
+			encoded, err := json.Marshal(effective)
+			if err != nil {
+				return rules
+			}
+			doc["reasoning_effort"] = encoded
+		}
 		rules = append(rules, ruleReasoningEffort)
 	}
 
-	// Reasoning on (no tools, effort not "none") refuses sampling params.
-	if effort != "none" {
+	if converter.GPT6StripsSampling(model, hasTools, effective) {
 		for _, field := range []string{"temperature", "top_p"} {
 			if _, ok := doc[field]; ok {
 				delete(doc, field)
@@ -164,4 +174,36 @@ func isChatCompletionsPath(path string) bool {
 func hasNonEmptyArray(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	return len(trimmed) > 0 && trimmed[0] == '[' && !bytes.Equal(trimmed, []byte("[]"))
+}
+
+// substituteUnavailableModel rewrites the body's "model" when the requested
+// one is marked unavailable and a fallback is configured for it. It returns
+// the original slice when nothing applies, so the passthrough route keeps its
+// byte-for-byte promise for every body it does not positively recognize.
+func (s *Server) substituteUnavailableModel(body []byte) (out []byte, from, to string) {
+	if len(s.cfg.ModelHealth.Fallbacks) == 0 || len(body) == 0 {
+		return body, "", ""
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
+		return body, "", ""
+	}
+	var model string
+	if err := json.Unmarshal(doc["model"], &model); err != nil || model == "" {
+		return body, "", ""
+	}
+	fallback, ok := s.substitutedModel(model, hasNonEmptyArray(doc["tools"]))
+	if !ok {
+		return body, "", ""
+	}
+	encoded, err := json.Marshal(fallback)
+	if err != nil {
+		return body, "", ""
+	}
+	doc["model"] = encoded
+	rewritten, err := json.Marshal(doc)
+	if err != nil {
+		return body, "", ""
+	}
+	return rewritten, model, fallback
 }

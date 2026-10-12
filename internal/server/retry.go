@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +18,122 @@ import (
 // several times, which requires a replayable body — see doUpstreamRetry's
 // replayable parameter.
 type retryAttempt func() (*http.Response, error)
+
+// transientUpstreamPatterns are the gateway's channel-rotation errors.
+//
+// They are anchored at the START of the upstream's own error message, with
+// only the model-id slot left free, because the body is client-influenced:
+// the gateway echoes model ids and parameter values into its error text, and
+// a match here flips process-global state (model_health marks the model
+// unavailable, which can switch it to emulation or a fallback for EVERY
+// user). A client must not be able to forge a "the channel is broken"
+// verdict by naming a model or a field after a marker phrase, so the match
+// is structural — parse the envelope, take the gateway's message, require
+// the gateway's template — rather than a substring scan over raw bytes.
+//
+// Measured samples (2026-10-10/12, all of them start the message):
+//
+//	GPT-6: gpt-6.1-sol tool calling requires /v1/responses or configured Chat-to-Responses routing  (type: api_upstream_error) (request_id: …)
+//	GPT-6: gpt-6.1-sol reasoning effort must be low, medium, high, xhigh, or max  (type: api_upstream_error) (request_id: …)
+//	Unsupported value: 'reasoning_effort' does not support 'none' with this model. Supported values are: 'low', …
+//	Unsupported value: 'none' is not supported with the 'gpt-6.1-sol-2026-09-29' model. …
+//	Model resources are currently busy. Please try again later. (request_id: …)
+//	Insufficient quota available for instant inference. (type: deployment_disabled) (request_id: …)
+var transientUpstreamPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^GPT-6: [A-Za-z0-9._\-/]{1,128} tool calling requires /v1/responses or configured Chat-to-Responses routing`),
+	regexp.MustCompile(`^GPT-6: [A-Za-z0-9._\-/]{1,128} reasoning effort must be low, medium, high, xhigh, or max`),
+	regexp.MustCompile(`^Unsupported value: 'reasoning_effort' does not support 'none' with this model`),
+	regexp.MustCompile(`^Unsupported value: 'none' is not supported with the '[A-Za-z0-9._\-/]{1,128}' model`),
+	regexp.MustCompile(`^Model resources are currently busy`),
+	regexp.MustCompile(`^Insufficient quota available for instant inference`),
+}
+
+// upstreamErrorText pulls the human message out of an upstream error body.
+// Gateways nest it differently per mount ({"detail":{"message":…}},
+// {"error":{"message":…}}, and the Anthropic mount wraps a JSON string), so
+// the extraction is bounded and recursive rather than a scan.
+func upstreamErrorText(body []byte) string {
+	const maxDepth = 3
+	text := string(body)
+	for depth := 0; depth < maxDepth; depth++ {
+		trimmed := strings.TrimSpace(text)
+		if !strings.HasPrefix(trimmed, "{") {
+			return trimmed
+		}
+		var env struct {
+			Detail struct {
+				Message string `json:"message"`
+			} `json:"detail"`
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
+			return trimmed
+		}
+		next := env.Detail.Message
+		if next == "" {
+			next = env.Error.Message
+		}
+		if next == "" {
+			next = env.Message
+		}
+		if next == "" {
+			return trimmed
+		}
+		text = next
+	}
+	return strings.TrimSpace(text)
+}
+
+// isCandidateTransientStatus reports whether a status can carry a
+// channel-rotation error at all. Kept separate so the (blocking) body peek
+// runs for error responses only.
+func isCandidateTransientStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusServiceUnavailable
+}
+
+// isTransientUpstreamResponse reports whether a non-2xx upstream response is
+// worth retrying with the identical body, and whether it may be attributed to
+// the model as a gateway/channel failure.
+func isTransientUpstreamResponse(status int, body []byte) bool {
+	if !isCandidateTransientStatus(status) {
+		return false
+	}
+	message := upstreamErrorText(body)
+	if message == "" {
+		return false
+	}
+	for _, pattern := range transientUpstreamPatterns {
+		if pattern.MatchString(message) {
+			return true
+		}
+	}
+	return false
+}
+
+// peekBody reads up to limit bytes of the response body and restores the
+// stream, so callers can inspect an error body without consuming it.
+func peekBody(resp *http.Response, limit int64) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		// Could not read: hand the caller what we got and let it stream on.
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body}
+		return prefix
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body}
+	return prefix
+}
 
 // doUpstreamRetry issues the upstream attempt and absorbs transient 429s
 // ("too many concurrent requests" at the gateway) with bounded retries.
@@ -33,15 +152,57 @@ type retryAttempt func() (*http.Response, error)
 // The final response is always returned with its body untouched; the
 // caller owns closing it. On context cancellation during a backoff the
 // context error is returned.
-func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route string, replayable bool, attempt retryAttempt) (*http.Response, error) {
+func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route string, replayable bool, model string, attempt retryAttempt) (*http.Response, error) {
 	rc := s.cfg.UpstreamRetry
+	// A model the gateway has been failing gets one attempt per request
+	// instead of the full retry budget: inside a failure window the retries
+	// cannot succeed (measured windows last 15+ minutes), and that single
+	// attempt doubles as the recovery probe.
+	canRetry := rc.Enabled && replayable && rc.MaxAttempts > 1 &&
+		!s.health.unavailable(model) && !s.health.inProbation(model)
+	if model != "" && s.health.unavailable(model) {
+		// Served while the model is still marked unavailable: exactly one
+		// upstream attempt instead of the retry budget. Emulated and
+		// fallback-substituted requests carry an empty or different model
+		// here, so this counts the fast-fail path only.
+		s.metrics.ModelUnavailableTotal.With("single_attempt").Inc()
+	}
 
 	resp, err := attempt()
-	if err != nil || resp.StatusCode != http.StatusTooManyRequests {
+	if err != nil {
 		return resp, err
 	}
+	// The body is only inspected for the statuses a channel-rotation error can
+	// arrive with. A successful response is never touched: its body may be an
+	// open SSE stream, and reading even one byte here would break per-chunk
+	// delivery (and block until the stream ends).
+	if resp.StatusCode != http.StatusTooManyRequests {
+		if !isCandidateTransientStatus(resp.StatusCode) ||
+			!isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10)) {
+			if resp.StatusCode < http.StatusBadRequest {
+				s.health.noteSuccess(model)
+			}
+			return resp, nil
+		}
+		// Channel-rotation failure (see transientUpstreamMarkers): identical
+		// request, identical body — only the channel behind it differs.
+		if s.health.noteFailure(model) {
+			s.logger.Warn("model marked unavailable after repeated channel-rotation failures",
+				"request_id", middleware.RequestIDOf(r), "route", route, "model", model,
+				"threshold", s.cfg.ModelHealth.FailureThreshold,
+				"cooldown", s.cfg.ModelHealth.Cooldown.String())
+		}
+		if !canRetry {
+			return resp, nil
+		}
+		out, err := s.retryTransientUpstream(ctx, r, route, attempt, resp)
+		if err == nil && out != nil && out.StatusCode < http.StatusBadRequest {
+			s.health.noteSuccess(model)
+		}
+		return out, err
+	}
 	s.metrics.Upstream429Total.With(route).Inc()
-	if !rc.Enabled || !replayable || rc.MaxAttempts <= 1 {
+	if !canRetry {
 		return resp, nil
 	}
 
@@ -98,6 +259,55 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 			return resp, nil
 		}
 		s.metrics.Upstream429Total.With(route).Inc()
+	}
+}
+
+// retryTransientUpstream re-sends a request whose first response was a
+// channel-rotation failure. Same budget/backoff machinery as the 429 path:
+// the retry happens while the caller still holds its queue slots (backpressure,
+// not piling on load), and the last response is returned untouched for the
+// caller to relay.
+func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, route string, attempt retryAttempt, resp *http.Response) (*http.Response, error) {
+	rc := s.cfg.UpstreamRetry
+	backoff := rc.InitialBackoff
+	attempts := 1
+	start := time.Now()
+	for {
+		delay := backoff
+		if delay > rc.MaxBackoff {
+			delay = rc.MaxBackoff
+		}
+		if attempts >= rc.MaxAttempts || time.Since(start)+delay > rc.Budget {
+			s.metrics.RetryExhaustedTotal.Inc()
+			s.logger.Warn("upstream returned a channel-rotation error; retry budget exhausted",
+				"request_id", middleware.RequestIDOf(r), "route", route,
+				"status", resp.StatusCode, "attempts", attempts)
+			return resp, nil
+		}
+		drainAndClose(resp)
+		s.metrics.RetriesAbsorbedTotal.Inc()
+		s.logger.Warn("upstream returned a channel-rotation error; retrying the same body",
+			"request_id", middleware.RequestIDOf(r), "route", route,
+			"status", resp.StatusCode, "attempt", attempts, "delay_ms", delay.Milliseconds())
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		attempts++
+		if backoff < rc.MaxBackoff {
+			backoff *= 2
+			if backoff > rc.MaxBackoff {
+				backoff = rc.MaxBackoff
+			}
+		}
+		resp, err := attempt()
+		if err != nil {
+			return nil, err
+		}
+		if body := peekBody(resp, 4<<10); !isTransientUpstreamResponse(resp.StatusCode, body) {
+			return resp, nil
+		}
 	}
 }
 
