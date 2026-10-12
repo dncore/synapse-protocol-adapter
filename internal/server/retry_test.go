@@ -39,6 +39,87 @@ func mkResp(code int, retryAfter, body string) *http.Response {
 	return &http.Response{StatusCode: code, Header: h, Body: io.NopCloser(strings.NewReader(body))}
 }
 
+// mkSSEResp builds a streaming (text/event-stream) 200 response.
+func mkSSEResp(body string) *http.Response {
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// 流式呈现的渠道轮换失败:200 + 首帧错误(2026-10-12 实测——流式客户端收到的
+// "Provider returned 400" 就是这一帧;按状态分类对它完全不生效,必须按首帧文本)。
+func TestTransientStreamErrorClassification(t *testing.T) {
+	errorFrame := "data: {\"error\": {\"message\": \"Provider returned 400\", \"type\": \"api_error\", \"http_status\": 400}}\n\n"
+	if !isTransientStreamError([]byte(errorFrame)) {
+		t.Fatal("网关流式错误帧应判为渠道轮换")
+	}
+	normal := "data: {\"id\":\"chatcmpl-x\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+	if isTransientStreamError([]byte(normal)) {
+		t.Fatal("正常分片不该命中")
+	}
+	// 伪造:整句之外任何附加内容都不认(全文锚定)
+	forged := "data: {\"error\": {\"message\": \"Provider returned 400 with details\"}}\n\n"
+	if isTransientStreamError([]byte(forged)) {
+		t.Fatal("伪造文案不该命中")
+	}
+}
+
+// 200 + 首帧错误:记一次失败并按预算重试;重试成功后的流式字节原样保留(含首帧)。
+func TestUpstreamRetryAbsorbsStreamedErrorFrame(t *testing.T) {
+	cfg := fastRetryConfig()
+	s := retryTestServer(cfg)
+	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
+	var calls atomic.Int64
+	resp, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
+		func() (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return mkSSEResp("data: {\"error\": {\"message\": \"Provider returned 400\", \"type\": \"api_error\", \"http_status\": 400}}\n\n"), nil
+			}
+			return mkSSEResp("data: {\"id\":\"chatcmpl-1\",\"choices\":[]}\n\ndata: [DONE]\n\n"), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("首帧错误的 200 应触发重试,实际尝试 %d 次", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "chatcmpl-1") || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("重试后的流式字节被破坏: %q", body)
+	}
+	// 被重试吸收:与 429 语义一致,成功即清零。
+	if s.health.unavailable("gpt-6.1-sol") || s.health.failureCount("gpt-6.1-sol") != 0 {
+		t.Fatal("重试吸收成功后的健康状态应干净")
+	}
+}
+
+// 已标记模型:流式错误 200 不重试、不当作恢复——标记必须保持(否则流式客户端
+// 在窗口内永远无法触发模拟接管)。
+func TestUpstreamStreamErrorFrameKeepsMark(t *testing.T) {
+	cfg := fastRetryConfig()
+	s := retryTestServer(cfg)
+	s.health = newModelHealth(cfg.ModelHealth.FailureThreshold, cfg.ModelHealth.Cooldown)
+	s.health.noteFailure("gpt-6.1-sol")
+	s.health.noteFailure("gpt-6.1-sol")
+	var calls atomic.Int64
+	_, err := s.doUpstreamRetry(context.Background(),
+		httptest.NewRequest("POST", "/v1/chat/completions", nil), "convert", true, "gpt-6.1-sol",
+		func() (*http.Response, error) {
+			calls.Add(1)
+			return mkSSEResp("data: {\"error\": {\"message\": \"Provider returned 400\", \"type\": \"api_error\", \"http_status\": 400}}\n\n"), nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("已标记模型应只打一次,实际 %d", got)
+	}
+	if !s.health.unavailable("gpt-6.1-sol") {
+		t.Fatal("流式错误 200 不得清掉标记")
+	}
+}
+
 func TestUpstreamRetry_AbsorbsThenSucceeds(t *testing.T) {
 	var calls atomic.Int64
 	s := retryTestServer(fastRetryConfig())

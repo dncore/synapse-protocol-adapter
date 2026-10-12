@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -39,6 +40,7 @@ type retryAttempt func() (*http.Response, error)
 //	Unsupported value: 'none' is not supported with the 'gpt-6.1-sol-2026-09-29' model. …
 //	Model resources are currently busy. Please try again later. (request_id: …)
 //	Insufficient quota available for instant inference. (type: deployment_disabled) (request_id: …)
+//	Provider returned 400   ← only inside a 200 SSE frame; no trailing text (measured 2026-10-12)
 var transientUpstreamPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^GPT-6: [A-Za-z0-9._\-/]{1,128} tool calling requires /v1/responses or configured Chat-to-Responses routing`),
 	regexp.MustCompile(`^GPT-6: [A-Za-z0-9._\-/]{1,128} reasoning effort must be low, medium, high, xhigh, or max`),
@@ -46,6 +48,12 @@ var transientUpstreamPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^Unsupported value: 'none' is not supported with the '[A-Za-z0-9._\-/]{1,128}' model`),
 	regexp.MustCompile(`^Model resources are currently busy`),
 	regexp.MustCompile(`^Insufficient quota available for instant inference`),
+	// The streaming presentation of any of the failures above: the gateway has
+	// already sent 200 + text/event-stream headers when its upstream fails, so
+	// the error arrives as the first SSE frame with this generic message and
+	// the real text is lost. Full-match: the entire message is only this
+	// sentence, nothing client-supplied can ride along.
+	regexp.MustCompile(`^Provider returned [45]\d\d$`),
 }
 
 // upstreamErrorText pulls the human message out of an upstream error body.
@@ -113,6 +121,106 @@ func isTransientUpstreamResponse(status int, body []byte) bool {
 	return false
 }
 
+// startSSEFrameClassifier watches a streaming 2xx response for the gateway's
+// streamed channel-rotation error.
+//
+// The gateway reports an upstream failure that happens after the stream's
+// 200 headers already went out as the stream's FIRST frame — data:
+// {"error":{"message":"Provider returned 400",…}} — which the status-based
+// classification can never see (measured 2026-10-12: the identical
+// non-streaming request got a 400 with the gateway's detailed message while
+// streaming clients got this generic frame, so every streamed request
+// bypassed retries, health marks and emulation entirely).
+//
+// The body is pumped in a goroutine that owns it from here on: every byte is
+// forwarded through a pipe unchanged, the first frame is classified on the
+// way, and the verdict is delivered on the returned channel (false on the
+// closed channel for clean streams and non-SSE responses). Callers wait for
+// the verdict with a short bound: the error frame arrives immediately, while
+// a real stream's first frame is simply forwarded as it comes — a slow first
+// token is never held back.
+func startSSEFrameClassifier(resp *http.Response) <-chan bool {
+	verdict := make(chan bool, 1)
+	if resp == nil || resp.Body == nil ||
+		!strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		close(verdict)
+		return verdict
+	}
+	orig := resp.Body
+	pr, pw := io.Pipe()
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{pr, orig}
+	go func() {
+		defer pw.Close()
+		br := bufio.NewReaderSize(orig, 16<<10)
+		var frame bytes.Buffer
+		for {
+			line, err := br.ReadBytes('\n')
+			if len(line) > 0 {
+				if int64(frame.Len()+len(line)) > 4<<10 {
+					break // first frame implausibly large: not the error frame
+				}
+				frame.Write(line)
+				if len(bytes.TrimRight(line, "\r\n")) == 0 {
+					break // blank line: end of the first frame
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		if isTransientStreamError(frame.Bytes()) {
+			verdict <- true
+		}
+		// Verdict closes as soon as the first frame is classified — not at
+		// stream end — so clean streams resolve the wait immediately.
+		close(verdict)
+		if _, err := pw.Write(frame.Bytes()); err != nil {
+			return // consumer went away
+		}
+		_, _ = io.Copy(pw, br)
+	}()
+	return verdict
+}
+
+// awaitStreamVerdict waits up to the bound for the classifier's verdict. A
+// closed channel (clean frame, EOF, non-SSE) returns immediately; no verdict
+// within the bound means a live stream whose first frame is still coming.
+func awaitStreamVerdict(verdict <-chan bool) bool {
+	select {
+	case bad := <-verdict:
+		return bad
+	case <-time.After(streamPeekWindow):
+		return false
+	}
+}
+
+// streamPeekWindow bounds how long the first frame may take before a stream
+// is presumed real. The gateway's error frame lands within milliseconds; a
+// real first token can take a minute on reasoning models, and it is
+// forwarded as it arrives either way.
+const streamPeekWindow = 2 * time.Second
+
+// isTransientStreamError reports whether a peeked SSE frame carries the
+// gateway's streamed channel-rotation error. Classification reuses the
+// envelope extraction and pattern set of isTransientUpstreamResponse; the
+// 400 is only the pattern-enablement gate (the classification is about the
+// message text, which is status-independent).
+func isTransientStreamError(frame []byte) bool {
+	for _, line := range strings.Split(string(frame), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		if isTransientUpstreamResponse(http.StatusBadRequest, []byte(strings.TrimSpace(strings.TrimPrefix(line, "data:")))) {
+			return true
+		}
+	}
+	return false
+}
+
 // peekBody reads up to limit bytes of the response body and restores the
 // stream, so callers can inspect an error body without consuming it.
 func peekBody(resp *http.Response, limit int64) []byte {
@@ -172,13 +280,19 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 	if err != nil {
 		return resp, err
 	}
-	// The body is only inspected for the statuses a channel-rotation error can
-	// arrive with. A successful response is never touched: its body may be an
-	// open SSE stream, and reading even one byte here would break per-chunk
-	// delivery (and block until the stream ends).
+	// Error statuses are classified from their body. A 2xx is additionally
+	// watched for the gateway's streamed error frame (see
+	// startSSEFrameClassifier): the first frame is classified while a pump
+	// goroutine forwards every byte unchanged, so a real stream pays nothing
+	// and a slow first token is never held back. Non-SSE 2xx bodies are never
+	// read here.
 	if resp.StatusCode != http.StatusTooManyRequests {
-		if !isCandidateTransientStatus(resp.StatusCode) ||
-			!isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10)) {
+		transient := isCandidateTransientStatus(resp.StatusCode) &&
+			isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10))
+		if !transient && resp.StatusCode < http.StatusBadRequest {
+			transient = awaitStreamVerdict(startSSEFrameClassifier(resp))
+		}
+		if !transient {
 			if resp.StatusCode < http.StatusBadRequest {
 				s.health.noteSuccess(model)
 			}
@@ -195,8 +309,8 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 		if !canRetry {
 			return resp, nil
 		}
-		out, err := s.retryTransientUpstream(ctx, r, route, attempt, resp)
-		if err == nil && out != nil && out.StatusCode < http.StatusBadRequest {
+		out, stillTransient, err := s.retryTransientUpstream(ctx, r, route, attempt, resp)
+		if err == nil && out != nil && !stillTransient && out.StatusCode < http.StatusBadRequest {
 			s.health.noteSuccess(model)
 		}
 		return out, err
@@ -266,8 +380,10 @@ func (s *Server) doUpstreamRetry(ctx context.Context, r *http.Request, route str
 // channel-rotation failure. Same budget/backoff machinery as the 429 path:
 // the retry happens while the caller still holds its queue slots (backpressure,
 // not piling on load), and the last response is returned untouched for the
-// caller to relay.
-func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, route string, attempt retryAttempt, resp *http.Response) (*http.Response, error) {
+// caller to relay. The second return value reports whether that last
+// response is itself another channel-rotation failure (status- or
+// streamed-frame-classified): the caller must not count it as a recovery.
+func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, route string, attempt retryAttempt, resp *http.Response) (*http.Response, bool, error) {
 	rc := s.cfg.UpstreamRetry
 	backoff := rc.InitialBackoff
 	attempts := 1
@@ -282,7 +398,7 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 			s.logger.Warn("upstream returned a channel-rotation error; retry budget exhausted",
 				"request_id", middleware.RequestIDOf(r), "route", route,
 				"status", resp.StatusCode, "attempts", attempts)
-			return resp, nil
+			return resp, true, nil
 		}
 		drainAndClose(resp)
 		s.metrics.RetriesAbsorbedTotal.Inc()
@@ -292,7 +408,7 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 		attempts++
 		if backoff < rc.MaxBackoff {
@@ -303,10 +419,15 @@ func (s *Server) retryTransientUpstream(ctx context.Context, r *http.Request, ro
 		}
 		resp, err := attempt()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		if body := peekBody(resp, 4<<10); !isTransientUpstreamResponse(resp.StatusCode, body) {
-			return resp, nil
+		transient := isCandidateTransientStatus(resp.StatusCode) &&
+			isTransientUpstreamResponse(resp.StatusCode, peekBody(resp, 4<<10))
+		if !transient && resp.StatusCode < http.StatusBadRequest {
+			transient = awaitStreamVerdict(startSSEFrameClassifier(resp))
+		}
+		if !transient {
+			return resp, false, nil
 		}
 	}
 }
