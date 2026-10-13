@@ -96,6 +96,10 @@ type Item struct {
 	Name      string  `json:"name,omitempty"`
 	CallID    string  `json:"call_id,omitempty"`
 	Arguments *string `json:"arguments,omitempty"`
+	// Namespace names the namespace wrapper a function_call belongs to. It is
+	// what Codex dispatches on: a bare nested name alone is rejected as an
+	// "unsupported call" (measured 2026-10-13, Codex CLI 0.162.1).
+	Namespace string `json:"namespace,omitempty"`
 
 	// function_call_output: a plain string (Codex) or an array of typed
 	// content parts (newer clients). Both are accepted.
@@ -158,11 +162,14 @@ type ContentPart struct {
 // Tool is a function tool definition in Responses shape (flattened,
 // unlike chat completions' nested form).
 type Tool struct {
-	Type        string          `json:"type"` // "function"
+	Type        string          `json:"type"` // "function" | "namespace" | built-in
 	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 	Strict      *bool           `json:"strict,omitempty"`
+	// Tools carries the members of a "namespace" wrapper (Codex groups each
+	// MCP server's tools, and its own multi-agent tools, this way).
+	Tools []Tool `json:"tools,omitempty"`
 }
 
 // Response is the non-streamed Responses API response object.

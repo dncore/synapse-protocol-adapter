@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dncore/synapse-protocol-adapter/internal/completions"
 	"github.com/dncore/synapse-protocol-adapter/internal/config"
 	"github.com/dncore/synapse-protocol-adapter/internal/metrics"
 	"github.com/dncore/synapse-protocol-adapter/internal/responses"
@@ -472,9 +473,11 @@ func TestProxy_UnlimitedConcurrency(t *testing.T) {
 	}
 }
 
-// In-band rejection: gateway answers HTTP 200 but streams {"error":{...}}
-// as the (only) chunk. The client must see a clear error event, never a
-// silently empty response.completed.
+// In-band rejection carried by the stream's opening frame: the gateway
+// answers HTTP 200 but streams {"error":{...}} first. Nothing has reached the
+// client yet, so the rejection is answerable with a status code — an in-stream
+// error event is invisible to clients that only look at the HTTP status and
+// the terminal event (Codex CLI ignores `event: error` and discards the turn).
 func TestProxy_StreamInBandError(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -493,13 +496,143 @@ func TestProxy_StreamInBandError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a forbidden in-band error", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "event-stream") {
+		t.Fatalf("rejection answered as a stream, want an error body (Content-Type %q)", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Model access denied") {
+		t.Fatalf("upstream message lost:\n%s", body)
+	}
+}
+
+// A rejection arriving after output has already been streamed cannot change
+// the status, so it keeps the error event AND closes the turn properly: the
+// client keeps what it received instead of losing the whole turn.
+func TestProxy_StreamInBandErrorAfterOutputCompletes(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial answer\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"error\":{\"message\":\"channel went away\",\"type\":\"api_error\"}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/v1/responses", "application/json", strings.NewReader(responsesBody(true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	text := string(body)
-	if !strings.Contains(text, `"type":"error"`) || !strings.Contains(text, "Model access denied") {
-		t.Fatalf("in-band error not surfaced:\n%s", text)
+	if !strings.Contains(text, "channel went away") {
+		t.Fatalf("error event missing:\n%s", text)
+	}
+	if !strings.Contains(text, "event: response.completed") {
+		t.Fatalf("turn with produced output must be closed with response.completed:\n%s", text)
+	}
+	if !strings.Contains(text, "partial answer") {
+		t.Fatalf("already-produced output was dropped:\n%s", text)
+	}
+}
+
+// The counterpart: a rejection that arrives before any output must NOT produce
+// a completion, because that would tell the client the model answered when it
+// did not. The opening frame here is a role delta, so the peek passes it
+// through and the error lands mid-stream.
+func TestProxy_StreamInBandErrorWithoutOutputDoesNotComplete(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"error\":{\"message\":\"channel went away\",\"type\":\"api_error\"}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL)
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/v1/responses", "application/json", strings.NewReader(responsesBody(true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if !strings.Contains(text, "channel went away") {
+		t.Fatalf("error event missing:\n%s", text)
 	}
 	if strings.Contains(text, "response.completed") {
-		t.Fatalf("must not complete after in-band rejection:\n%s", text)
+		t.Fatalf("must not complete a turn that produced no output:\n%s", text)
+	}
+}
+
+// A stream that opens but never sends a frame must not hold the client's
+// response headers open indefinitely: the peek gives up and the stream
+// proceeds as before, leaving the client's own timeouts in charge.
+func TestProxy_StalledStreamStillGetsHeaders(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+	defer close(release)
+
+	s := newTestServer(t, up.URL)
+	proxySrv := httptest.NewServer(s.httpSrv.Handler)
+	defer proxySrv.Close()
+
+	start := time.Now()
+	resp, err := http.Post(proxySrv.URL+"/v1/responses", "application/json", strings.NewReader(responsesBody(true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if elapsed := time.Since(start); elapsed > 3*peekFirstFrameTimeout {
+		t.Fatalf("headers took %s; the peek bound was not applied", elapsed)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "event-stream") {
+		t.Fatalf("Content-Type = %q, want an SSE stream", ct)
+	}
+}
+
+func TestInBandRejectionStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		err  completions.ErrorBody
+		want int
+	}{
+		{"forbidden type", completions.ErrorBody{Type: "forbidden", Message: "nope"}, http.StatusForbidden},
+		{"permission wording", completions.ErrorBody{Type: "api_error", Message: "permission denied"}, http.StatusForbidden},
+		{"rate limit", completions.ErrorBody{Type: "api_error", Message: "Too many requests in recent 10 seconds. Maximum allowed: 20"}, http.StatusTooManyRequests},
+		{"quota", completions.ErrorBody{Type: "api_error", Message: "quota exhausted"}, http.StatusTooManyRequests},
+		// A bare "limit" must not become a retriable 429: this one is fatal.
+		{"context limit stays an upstream error", completions.ErrorBody{Type: "api_error", Message: "context length limit exceeded"}, http.StatusBadGateway},
+		{"generic", completions.ErrorBody{Type: "api_error", Message: "Provider returned 400"}, http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inBandRejectionStatus(&tc.err); got != tc.want {
+				t.Fatalf("status = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

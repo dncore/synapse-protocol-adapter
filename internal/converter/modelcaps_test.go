@@ -55,12 +55,47 @@ func TestGPT6SolSamplingPolicy(t *testing.T) {
 		t.Fatal("no tools: sampling must survive")
 	}
 	// luna keeps the older effort-based rule: sampling survives while the
-	// effort is an explicit "none" (tools force it), and is dropped otherwise.
+	// effort is an explicit "none", and is dropped otherwise.
 	if GPT6StripsSampling("gpt-6-luna", true, "none") {
-		t.Fatal("luna with tools forces none — sampling must survive, measured 2026-10-10")
+		t.Fatal("luna with an explicit none effort — sampling must survive, measured 2026-10-10")
 	}
 	if !GPT6StripsSampling("gpt-6-luna", false, "high") {
 		t.Fatal("luna reasoning on: sampling must be dropped")
+	}
+}
+
+// A tool-bearing luna turn keeps the client's effort. Synapse used to force
+// "none" here while the other three repos stopped doing so on 2026-10-10,
+// which meant a client asking for high silently got no reasoning at all.
+func TestGPT6LunaToolTurnShape(t *testing.T) {
+	effortCases := []struct {
+		name string
+		want string
+		out  string
+	}{
+		{name: "high is kept", want: "high", out: "high"},
+		{name: "xhigh is kept", want: "xhigh", out: "xhigh"},
+		{name: "medium is kept", want: "medium", out: "medium"},
+		{name: "low is kept", want: "low", out: "low"},
+		{name: "none is kept", want: "none", out: "none"},
+		{name: "omitted falls back to none", want: "", out: "none"},
+		{name: "minimal is not in luna's set", want: "minimal", out: "none"},
+		{name: "max is not in luna's set", want: "max", out: "none"},
+	}
+	for _, tc := range effortCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeGPT6Effort("gpt-6-luna", tc.want, true); got != tc.out {
+				t.Fatalf("tools + effort %q: got %q, want %q", tc.want, got, tc.out)
+			}
+		})
+	}
+	// Without tools the same accepted set passes through and anything else is
+	// dropped rather than sent to a 400.
+	if got := NormalizeGPT6Effort("gpt-6-luna", "high", false); got != "high" {
+		t.Fatalf("no tools, accepted effort: got %q, want high", got)
+	}
+	if got := NormalizeGPT6Effort("gpt-6-luna", "max", false); got != "" {
+		t.Fatalf("no tools, rejected effort must be dropped: got %q", got)
 	}
 }
 

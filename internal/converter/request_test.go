@@ -175,11 +175,12 @@ func TestConvertRequest_ParametersPassthrough(t *testing.T) {
 	}
 }
 
-// gpt-6 on the shared gateway's chat route makes function tools and
-// reasoning_effort mutually exclusive and treats an omitted effort as
-// non-none, so a tools request must carry an explicit "none". Codex sends
-// tools on every turn — without the override each gpt-6 turn 400s.
-func TestConvertRequest_GPT6ToolsForceReasoningNone(t *testing.T) {
+// gpt-6 ids once made function tools and reasoning_effort mutually exclusive,
+// so every tool-bearing turn had to carry an explicit "none" — Codex sends
+// tools on every turn, so that override decided the shape of all its traffic.
+// Re-measured 2026-10-13: luna accepts every value in its set with tools
+// present, so the override is gone and only the fallback remains.
+func TestConvertRequest_GPT6ToolTurnEffort(t *testing.T) {
 	tool := []responses.Tool{{Type: "function", Name: "get_time"}}
 	mk := func(model, effort string, withTools bool) *completions.Request {
 		req := &responses.Request{Model: model, Input: responses.Input{String: "hi"}}
@@ -195,15 +196,15 @@ func TestConvertRequest_GPT6ToolsForceReasoningNone(t *testing.T) {
 		}
 		return out
 	}
-	if got := mk("gpt-6-luna", "high", true); got.ReasoningEffort != "none" {
-		t.Fatalf("gpt-6 with tools must force reasoning_effort=none, got %q", got.ReasoningEffort)
+	if got := mk("gpt-6-luna", "high", true); got.ReasoningEffort != "high" {
+		t.Fatalf("gpt-6-luna with tools must keep the requested effort, got %q", got.ReasoningEffort)
 	}
 	if got := mk("gpt-6-luna", "", true); got.ReasoningEffort != "none" {
-		t.Fatalf("gpt-6 with tools and no effort must still send none, got %q", got.ReasoningEffort)
+		t.Fatalf("gpt-6-luna with tools and no effort must fall back to none, got %q", got.ReasoningEffort)
 	}
-	// Without tools the model reasons normally; the exclusion is tools-only.
+	// Without tools the model reasons normally; the fallback is tools-only.
 	if got := mk("gpt-6-luna", "high", false); got.ReasoningEffort != "high" {
-		t.Fatalf("gpt-6 without tools must keep the requested effort, got %q", got.ReasoningEffort)
+		t.Fatalf("gpt-6-luna without tools must keep the requested effort, got %q", got.ReasoningEffort)
 	}
 	// The rule must not leak onto sibling families that accept both.
 	if got := mk("gpt-5.6-luna", "high", true); got.ReasoningEffort != "high" {
@@ -257,7 +258,7 @@ func TestConvertRequest_GPT6SamplingParams(t *testing.T) {
 	}{
 		{name: "reasoning on via explicit effort", model: "gpt-6-luna", effort: "high", wantDropped: true},
 		{name: "reasoning on by default when effort is omitted", model: "gpt-6-luna", wantDropped: true},
-		{name: "tools force none, sampling survives", model: "gpt-6-luna", effort: "high", withTools: true},
+		{name: "tools keep the client effort, sampling is dropped while reasoning is on", model: "gpt-6-luna", effort: "high", withTools: true, wantDropped: true},
 		{name: "explicit none without tools keeps sampling", model: "gpt-6-luna", effort: "none"},
 		{name: "other families keep sampling untouched", model: "glm-5.3", effort: "high"},
 	}

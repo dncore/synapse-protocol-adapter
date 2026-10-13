@@ -243,12 +243,13 @@ and bodies — is streamed back byte-for-byte with a flush per read.
 The one opt-in exception is `passthrough.model_quirks`: with it enabled,
 bodies for model families whose API renamed or refuses a field the client
 sends are rewritten before forwarding — today the `gpt-6` family
-(`max_tokens` → `max_completion_tokens`, a tool-bearing turn forced onto an
-explicit `reasoning_effort` the model accepts, `temperature`/`top_p` dropped
+(`max_tokens` → `max_completion_tokens`, a tool-bearing turn kept on the
+client's own `reasoning_effort` where the model accepts it and moved to that
+model's floor where it does not, `temperature`/`top_p` dropped
 where the upstream refuses them, and on the Anthropic mount also `thinking`
 dropped and `max_tokens` renamed). The rules are **per model, not per
 family**: the Sol ids reject `"none"` outright and refuse sampling on tool
-turns, while luna keeps the older "tools ⇒ none" shape — see
+turns, luna accepts its documented set with tools present — see
 `internal/converter/modelcaps.go` for the dated measurements. Every other
 body — including every other model — still goes through untouched, and
 bodies above `passthrough.max_rewrite_bytes` are forwarded unchanged.
@@ -301,7 +302,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `developer` role messages | normalized to `system` (semantically identical, universally accepted) |
 | consecutive `function_call` items (parallel calls) | merged into ONE assistant message with N `tool_calls` |
 | `function_call` with only `id`, no `call_id` | `id` used as the tool call id |
-| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); on a **gpt-6** tool-bearing turn it is replaced by the model's own accepted value — `"none"` on luna, the floor `"low"` on the Sol ids, which reject `"none"` and refuse an omitted effort |
+| `reasoning.effort` | forwarded as chat `reasoning_effort` (unsupported providers ignore it); on a **gpt-6** tool-bearing turn it is kept when the model accepts it and otherwise replaced by that model's floor — the client's own value on luna (`low`/`medium`/`high`/`xhigh`/`none` all pass), the floor `"low"` on the Sol ids, which reject `"none"` and refuse an omitted effort |
 | `temperature`, `top_p` | same names; dropped where the upstream refuses them — luna while reasoning is on, the Sol ids on every tool-bearing turn |
 | tool `parameters` without top-level `type` | `{"type":"object"}` injected (several providers require it) |
 | `input[]` `message` items | messages (`system`/`developer`/`user`/`assistant` roles pass through) |
@@ -312,6 +313,7 @@ else. Only HTTP is forwarded (no WebSocket upgrades).
 | `refusal` content parts (history) | text parts carrying the refusal message |
 | `reasoning` items | dropped (no chat equivalent) |
 | `tools[]` (flattened) | `tools[]` (nested `function` object) |
+| `tools[]` `"namespace"` wrappers (Codex sends one per MCP server) | each member flattened into its own `function` named `<namespace>__<tool>`, and the call is answered with the bare nested name plus the wrapper restored — the pair Codex dispatches on. A flattened name alone is rejected as an `unsupported call`. Built-in types with no function shape (`web_search`, …) are still dropped |
 | `tool_choice` (`"auto"`/`"none"`/`"required"` or object form) | normalized; Cursor-style `{"type":"none"}` etc. map to their string forms, `{"type":"tool"}` → `"required"`, `{"type":"function","name"}` re-nested |
 | `max_output_tokens` | `max_tokens` (**gpt-6**: `max_completion_tokens` — the only name that family accepts) |
 | `temperature`, `top_p`, `parallel_tool_calls`, `user` | same names |
@@ -363,8 +365,26 @@ final usage chunk (empty choices)       (accounted into usage)
 
 Events carry strictly increasing `sequence_number`. Tool-call arguments
 accumulate per delta `index`, so interleaved parallel tool calls reassemble
-correctly. A stream that dies mid-flight produces an in-band `error` SSE
-event (headers are already committed at that point).
+correctly.
+
+How a failure is reported depends on how much of the response is already
+committed:
+
+- **Rejected by the opening frame.** The gateway answers a rejection with
+  `200` plus an error frame as the stream's *first* frame. Nothing has reached
+  the client yet, so the frame is read before the response is committed and
+  the client gets an HTTP status instead — `403` for a permission refusal,
+  `429` for rate/quota wording, `502` otherwise. An in-band `error` event
+  alone is invisible to clients that key on the status and the terminal event
+  (Codex CLI retries five times and then drops the turn), whereas a status is
+  not. The frame is awaited for at most `peekFirstFrameTimeout` (2s) so a
+  stalled upstream still hands the client its headers and leaves the client's
+  own timeouts in charge.
+- **Failed after output streamed.** The in-band `error` event is kept *and*
+  the turn is closed with `response.completed`, so the client keeps what it
+  already received.
+- **Failed before any output.** Only the `error` event is emitted; completing
+  such a turn would claim the model answered when it did not.
 
 ### Header handling
 

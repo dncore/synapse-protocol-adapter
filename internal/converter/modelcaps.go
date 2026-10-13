@@ -38,8 +38,17 @@ import "strings"
 //     gpt-6-sol), so clients asking for "none"/"off" are clamped to the
 //     model's floor ("low") instead of being rejected. This is the fix for
 //     the family-wide "tools ⇒ none" rule that 400s every Sol tool turn.
-//  2. luna keeps that older rule: "none" is the one value every channel
-//     accepted for it across 2026-09-24, 2026-09-29 and 2026-10-10.
+//  2. A tool-bearing luna request keeps the client's own effort whenever the
+//     model accepts it, and falls back to "none" only when it is absent or
+//     outside luna's set. The older rule forced "none" on every tool turn,
+//     which silently discarded what the client asked for — Codex sends
+//     reasoning_effort=high on every turn, so luna never reasoned under it.
+//     Re-measured 2026-10-13 against the shared gateway, one function tool
+//     per request, four attempts per value: none / low / medium / high /
+//     xhigh / omitted all returned 200 with finish_reason=tool_calls,
+//     streaming and non-streaming alike. The sibling client-config projects
+//     dropped the forcing on 2026-10-10; this table was the last one still
+//     applying it.
 //  3. A tool-bearing Sol request must not carry temperature/top_p; luna
 //     keeps the older effort-based rule (sampling survives while reasoning
 //     is explicitly off).
@@ -76,9 +85,11 @@ type modelCaps struct {
 // gpt6Caps is keyed by the exact, lowercased model id.
 var gpt6Caps = map[string]modelCaps{
 	"gpt-6-luna": {
+		// toolsEffort is the fallback only: the client's own value wins
+		// whenever luna accepts it (see the measurement note above).
 		efforts:          effortSet("none", "low", "medium", "high", "xhigh"),
 		toolsEffort:      "none",
-		forceToolsEffort: true,
+		forceToolsEffort: false,
 		stripSampling:    samplingWhenReasoningOn,
 	},
 	"gpt-6-sol": {

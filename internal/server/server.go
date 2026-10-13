@@ -758,21 +758,173 @@ func (s *Server) writeConvertedResponse(w http.ResponseWriter, chat *completions
 	s.metrics.RequestDuration.Observe(time.Since(start).Seconds())
 }
 
+// inBandRejectionStatus maps the gateway's in-band error frame to the HTTP
+// status the client should see. It exists so a rejection that arrives before
+// any output can be answered with a status code rather than a dead stream: an
+// in-stream error event is invisible to some clients, an HTTP status is not.
+//
+// The classification reads the frame's own text, since the gateway signals a
+// permission refusal as "forbidden" and a spent budget with rate/quota wording.
+// Matching stays on explicit phrases rather than bare "limit" so that a fatal
+// "context length limit exceeded" is not turned into a retriable 429.
+func inBandRejectionStatus(err *completions.ErrorBody) int {
+	hay := strings.ToLower(err.Type + " " + err.Code + " " + err.Message)
+	switch {
+	case strings.Contains(hay, "forbidden"), strings.Contains(hay, "permission"),
+		strings.Contains(hay, "unauthorized"), strings.Contains(hay, "access denied"):
+		return http.StatusForbidden
+	case strings.Contains(hay, "too many requests"), strings.Contains(hay, "rate limit"),
+		strings.Contains(hay, "rate_limit"), strings.Contains(hay, "quota"):
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+// peekFirstFrameTimeout bounds how long the stream's opening frame is awaited
+// before the client is committed to a 200 SSE response.
+//
+// The gateway answers a rejection with 200 + an error frame as the stream's
+// FIRST frame, and it rejects before calling a model, so that frame is quick
+// (measured 16-38 ms for a permission refusal). A healthy stream's opening
+// frame is the model's first token — waiting for it is what the client was
+// doing anyway. Waiting for a *stalled* upstream is not: the old behaviour of
+// sending headers immediately let the client's own timeouts apply, so the peek
+// gives up rather than holding a dead connection open.
+const peekFirstFrameTimeout = 2 * time.Second
+
 // streamResponse pumps the upstream SSE stream, converting each chunk and
 // flushing per event. Backpressure is implicit: a blocked write to the
 // client stops this loop reading upstream, propagating TCP backpressure
 // to the provider without buffering.
+//
+// The opening frame is read before the client is committed to a 200 SSE
+// response, so an upstream rejection carried by that frame is answered with an
+// HTTP status instead. Codex CLI 0.162.1 ignores in-stream error events
+// completely: given `200 + event: error` it retries the identical request five
+// times and then fails the turn with "stream closed before response.completed"
+// (measured 2026-10-13), which the user experiences as a turn that silently
+// stops. An HTTP status is visible to every client.
 func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx context.Context, cancel context.CancelFunc, resp *http.Response, req *responses.Request, start time.Time) {
 	rc := http.NewResponseController(w)
 	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+
+	streamer := converter.NewStreamer(req)
+
+	// One goroutine owns the upstream reader, so the opening frame can be
+	// awaited with a bound without racing the loop below for the same body.
+	type frame struct {
+		data string
+		err  error
+	}
+	frames := make(chan frame, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		reader := streaming.NewReader(resp.Body, s.cfg.Limits.MaxSSELine)
+		for {
+			data, err := reader.Next()
+			select {
+			case frames <- frame{data, err}:
+			case <-stop:
+				// The handler is done with this stream. Keep reading to the
+				// end anyway: the body is fed through the channel-rotation
+				// pump (startSSEFrameClassifier), which blocks writing into
+				// the pipe being read here, so abandoning it mid-way would
+				// strand that goroutine. Nothing is written to the client.
+				for err == nil {
+					_, err = reader.Next()
+				}
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	next := func() (string, error) {
+		select {
+		case f := <-frames:
+			return f.data, f.err
+		case <-stop:
+			return "", io.EOF
+		}
+	}
+
+	// Peek the opening frame. Only an SSE body is peeked: anything else is not
+	// a chat stream and keeps the old pass-through behaviour.
+	var pending *completions.StreamChunk
+	var peekErr error
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		bound := time.NewTimer(peekFirstFrameTimeout)
+		defer bound.Stop()
+	peek:
+		for {
+			var data string
+			var err error
+			select {
+			case f := <-frames:
+				data, err = f.data, f.err
+			case <-bound.C:
+				break peek // slow upstream: commit to SSE and stream as before
+			case <-r.Context().Done():
+				s.metrics.ErrorsTotal.With("canceled").Inc()
+				return
+			}
+			if err != nil {
+				if errors.Is(err, streaming.ErrDone) || errors.Is(err, io.EOF) {
+					break peek // empty stream: the normal path below finishes it
+				}
+				if r.Context().Err() != nil {
+					s.metrics.ErrorsTotal.With("canceled").Inc()
+					return
+				}
+				peekErr = err
+				break peek
+			}
+			if data == "" {
+				continue
+			}
+			var chunk completions.StreamChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				// Keep-alive noise in front of the real stream: skip it, as
+				// the main loop does.
+				s.logger.Warn("skipping malformed upstream chunk",
+					"request_id", middleware.RequestIDOf(r), "bytes", len(data))
+				continue
+			}
+			pending = &chunk
+			break peek
+		}
+
+		// The stream failed before producing anything, so there is no response
+		// to report one in.
+		if peekErr != nil {
+			s.metrics.UpstreamErrorsTotal.With("stream_broken").Inc()
+			s.writeProxyError(w, http.StatusBadGateway,
+				"upstream stream failed before any output: "+peekErr.Error())
+			return
+		}
+
+		// In-band rejection (HTTP 200 + {"error":...} frame): the gateway
+		// refusing the model or the quota. Nothing has been written, so the
+		// client gets a status it can act on instead of a stream that dies
+		// without ever carrying a completion.
+		if pending != nil && pending.Error != nil && pending.Error.Message != "" {
+			status := inBandRejectionStatus(pending.Error)
+			s.metrics.UpstreamErrorsTotal.With("stream_in_band_error").Inc()
+			s.logger.Warn("upstream rejected request in-band before any output",
+				"request_id", middleware.RequestIDOf(r), "status", status,
+				"error_type", pending.Error.Type, "code", pending.Error.Code)
+			s.writeProxyError(w, status, pending.Error.Message)
+			return
+		}
+	}
 
 	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
 	sw := streaming.NewWriter(w)
 	sw.Start()
 	s.metrics.ResponsesTotal.Inc()
-
-	reader := streaming.NewReader(resp.Body, s.cfg.Limits.MaxSSELine)
-	streamer := converter.NewStreamer(req)
 	firstByte := true
 
 	writeEvent := func(ev *responses.Event) bool {
@@ -793,8 +945,53 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 		return true
 	}
 
+	// salvage closes a failed mid-stream turn that already produced output:
+	// the client keeps what it received instead of losing the whole turn to a
+	// client that requires a terminal completion. A turn with no output keeps
+	// the error event alone.
+	salvage := func() {
+		if !streamer.Produced() {
+			return
+		}
+		for _, ev := range streamer.Finish() {
+			if !writeEvent(ev) {
+				return
+			}
+		}
+	}
+
+	// feed handles one upstream chunk; a false return ends the stream.
+	feed := func(chunk *completions.StreamChunk) bool {
+		if chunk.Error != nil && chunk.Error.Message != "" {
+			s.metrics.UpstreamErrorsTotal.With("stream_in_band_error").Inc()
+			s.logger.Warn("upstream rejected request in-band",
+				"request_id", middleware.RequestIDOf(r),
+				"error_type", chunk.Error.Type, "code", chunk.Error.Code)
+			_ = sw.WriteEvent("error", map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"code":    orDefault(chunk.Error.Code, "upstream_error"),
+					"message": chunk.Error.Message,
+					"type":    orDefault(chunk.Error.Type, "upstream_error"),
+				},
+			})
+			salvage()
+			return false
+		}
+		for _, ev := range streamer.Feed(chunk) {
+			if !writeEvent(ev) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if pending != nil && !feed(pending) {
+		return
+	}
+
 	for {
-		data, err := reader.Next()
+		data, err := next()
 		if err != nil {
 			if errors.Is(err, streaming.ErrDone) || errors.Is(err, io.EOF) {
 				break // normal end ([DONE]) or upstream closed cleanly
@@ -809,6 +1006,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 				"type":  "error",
 				"error": map[string]any{"code": "upstream_error", "message": "upstream stream terminated unexpectedly: " + err.Error()},
 			})
+			salvage()
 			return
 		}
 		if data == "" {
@@ -823,29 +1021,8 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, ctx cont
 			continue
 		}
 
-		// In-band rejection (HTTP 200 + {"error":...} chunk): a gateway
-		// refusing the model or quota. Fail loudly instead of completing
-		// an empty response.
-		if chunk.Error != nil && chunk.Error.Message != "" {
-			s.metrics.UpstreamErrorsTotal.With("stream_in_band_error").Inc()
-			s.logger.Warn("upstream rejected request in-band",
-				"request_id", middleware.RequestIDOf(r),
-				"error_type", chunk.Error.Type, "code", chunk.Error.Code)
-			_ = sw.WriteEvent("error", map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"code":    orDefault(chunk.Error.Code, "upstream_error"),
-					"message": chunk.Error.Message,
-					"type":    orDefault(chunk.Error.Type, "upstream_error"),
-				},
-			})
+		if !feed(&chunk) {
 			return
-		}
-
-		for _, ev := range streamer.Feed(&chunk) {
-			if !writeEvent(ev) {
-				return
-			}
 		}
 	}
 

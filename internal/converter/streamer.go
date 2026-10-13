@@ -22,15 +22,15 @@ type Streamer struct {
 	started bool
 
 	// Response skeleton assembled from the first chunk.
-	respID   string
-	created  int64
-	model    string
+	respID  string
+	created int64
+	model   string
 
 	// Reasoning output state (DeepSeek-style reasoning_content).
-	reasoningOpen    bool
-	reasoningItemID  string
-	reasoningBuf     []byte
-	reasoningOutIdx  int
+	reasoningOpen   bool
+	reasoningItemID string
+	reasoningBuf    []byte
+	reasoningOutIdx int
 
 	// Text output state.
 	textItemOpen  bool
@@ -42,6 +42,11 @@ type Streamer struct {
 
 	// Tool call accumulators, keyed by chat delta index.
 	tools map[int]*toolState
+
+	// namespaces maps the flattened name the model was offered back to the
+	// client's (namespace, name) pair, so a tool call is answered in the shape
+	// the client dispatches on.
+	namespaces map[string]namespacedTool
 
 	usage    *completions.Usage
 	finished bool
@@ -63,8 +68,20 @@ type toolState struct {
 // (used to echo configuration into the final response object).
 func NewStreamer(req *responses.Request) *Streamer {
 	return &Streamer{
-		req:   req,
-		tools: make(map[int]*toolState),
+		req:        req,
+		tools:      make(map[int]*toolState),
+		namespaces: namespaceIndex(req.Tools),
+	}
+}
+
+// callItem renders a model-chosen tool name into the item shape the client
+// dispatches on: a namespaced tool comes back as its bare nested name plus the
+// wrapper, everything else exactly as the model named it.
+func (s *Streamer) callItem(st *toolState, status string, args *string) *responses.Item {
+	name, namespace := resolveCallName(s.namespaces, st.name)
+	return &responses.Item{
+		Type: "function_call", ID: st.itemID, CallID: st.callID,
+		Name: name, Namespace: namespace, Arguments: args, Status: status,
 	}
 }
 
@@ -234,10 +251,7 @@ func (s *Streamer) feedChoice(ch *completions.StreamChoice) []*responses.Event {
 			events = append(events, &responses.Event{
 				Type: "response.output_item.added", SequenceNumber: s.nextSeq(),
 				OutputIndex: st.outputIdx,
-				Item: &responses.Item{
-					Type: "function_call", ID: st.itemID, CallID: st.callID,
-					Name: st.name, Arguments: &emptyArgs, Status: "in_progress",
-				},
+				Item:        s.callItem(st, "in_progress", &emptyArgs),
 			})
 		}
 		if tc.Function.Arguments != "" {
@@ -339,10 +353,7 @@ func (s *Streamer) closeOutput(finishReason string) []*responses.Event {
 			&responses.Event{
 				Type: "response.output_item.done", SequenceNumber: s.nextSeq(),
 				OutputIndex: st.outputIdx,
-				Item: &responses.Item{
-					Type: "function_call", ID: st.itemID, CallID: st.callID,
-					Name: st.name, Arguments: &st.arguments, Status: "completed",
-				},
+				Item:        s.callItem(st, "completed", &st.arguments),
 			},
 		)
 	}
@@ -378,10 +389,7 @@ func (s *Streamer) Finish() []*responses.Event {
 
 	for _, idx := range sortedToolIndexes(s.tools) {
 		st := s.tools[idx]
-		resp.Output = append(resp.Output, responses.Item{
-			Type: "function_call", ID: st.itemID, CallID: st.callID,
-			Name: st.name, Arguments: &st.arguments, Status: "completed",
-		})
+		resp.Output = append(resp.Output, *s.callItem(st, "completed", &st.arguments))
 	}
 	if s.textItemOpen || len(s.textBuf) > 0 || len(s.refusalBuf) > 0 {
 		resp.Output = append([]responses.Item{{
@@ -468,6 +476,29 @@ func reasoningDelta(d completions.Delta) string {
 // response.completed event, for metrics accounting by the caller.
 func (s *Streamer) FinalResponse() *responses.Response {
 	return s.final
+}
+
+// Produced reports whether any user-visible output has been emitted so far:
+// text, a refusal, a reasoning summary, or an announced tool call.
+//
+// It decides how a mid-stream upstream failure is closed. A turn that already
+// produced output is terminated with response.completed so the client keeps
+// what it received — Codex CLI 0.162.1 ignores in-stream error events
+// entirely and discards the whole turn when no completion arrives (measured
+// 2026-10-13). A turn that produced nothing keeps the error event alone:
+// completing it would tell the client the model answered when it did not.
+func (s *Streamer) Produced() bool {
+	if len(s.textBuf) > 0 || len(s.refusalBuf) > 0 || len(s.reasoningBuf) > 0 {
+		return true
+	}
+	for _, st := range s.tools {
+		// added means output_item.added already went to the client, so the
+		// client has seen this call even if its arguments never arrived.
+		if st.added || st.name != "" || st.arguments != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Streamer) nextSeq() int64 {

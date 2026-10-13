@@ -228,8 +228,8 @@ API 改名或拒收某字段的请求体会在被转发前改写——目前只�
 **自己接受**的 `reasoning_effort`；上游拒收的位置去掉
 `temperature`/`top_p`；Anthropic 挂载上还会去掉 `thinking` 并改名
 `max_tokens`）。规则**按模型而不是按族**：Sol 两个 id 直接拒收 `"none"`、
-且在带工具的请求上拒收采样参数，luna 则保留早期的「带工具 ⇒ none」形状
-——测量记录见 `internal/converter/modelcaps.go`。其余任何请求体（包括
+且在带工具的请求上拒收采样参数；luna 带工具时接受它自己那一组档位，客户端给的值
+原样保留 —— 测量记录见 `internal/converter/modelcaps.go`。其余任何请求体（包括
 其它所有模型）依旧逐字节透传；超过 `passthrough.max_rewrite_bytes` 的
 请求体也不改写、原样转发。
 
@@ -275,7 +275,7 @@ function 参数，并按模型方言发 `max_completion_tokens` + 该模型接�
 | `developer` 角色消息 | 归一为 `system`（语义等价，普遍被接受） |
 | 连续 `function_call` item（并行调用） | 合并为一条带 N 个 `tool_calls` 的 assistant 消息 |
 | 只有 `id` 没有 `call_id` 的 `function_call` | 用 `id` 作为 tool call id |
-| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 的回合会替换成该模型自己接受的值——luna 是 `"none"`，Sol 两个 id 是下限 `"low"`（它们拒收 `"none"`，也不接受省略） |
+| `reasoning.effort` | 作为 chat 的 `reasoning_effort` 转发（不支持的 provider 会忽略）；**gpt-6** 带 `tools` 的回合，模型接受时保留客户端给的值，不接受时才替换成该模型的下限——luna 自己那组（`low`/`medium`/`high`/`xhigh`/`none`）全都通过，Sol 两个 id 是下限 `"low"`（它们拒收 `"none"`，也不接受省略） |
 | `temperature`、`top_p` | 同名；上游拒收的位置丢弃——luna 在推理开启时，Sol 两个 id 在所有带工具的回合 |
 | 顶层缺 `type` 的工具 `parameters` | 注入 `{"type":"object"}`（部分 provider 强制要求） |
 | `input[]` 的 `message` item | 消息（`system`/`developer`/`user`/`assistant` 角色直传） |
@@ -286,6 +286,7 @@ function 参数，并按模型方言发 `max_completion_tokens` + 该模型接�
 | `refusal` 内容 part（历史） | 携带拒绝文本的 text part |
 | `reasoning` item | 丢弃（chat 侧无对应） |
 | `tools[]`（扁平结构） | `tools[]`（嵌套 `function` 对象） |
+| `tools[]` 的 `"namespace"` 包装（Codex 每个 MCP server 一个） | 每个成员展平成一个 `function`，名为 `<namespace>__<tool>`；回程时换回**裸的嵌套名 + 包装名**——这正是 Codex 用来派发的组合，单给展平名会被判 `unsupported call`。无 function 形状的内置类型（`web_search` 等）仍然丢弃 |
 | `tool_choice`（`"auto"`/`"none"`/`"required"` 或对象形式） | 归一化；Cursor 风格 `{"type":"none"}` 映射为字符串形式，`{"type":"tool"}` → `"required"`，`{"type":"function","name"}` 重新嵌套 |
 | `max_output_tokens` | `max_tokens`（**gpt-6** 用 `max_completion_tokens` —— 该族只认这个字段名） |
 | `temperature`、`top_p`、`parallel_tool_calls`、`user` | 同名 |
@@ -336,8 +337,21 @@ finish_reason                           reasoning_summary_text.done（若有）,
 ```
 
 事件携带严格递增的 `sequence_number`。tool-call 参数按 delta `index`
-累积，交错到达的并行 tool call 也能正确重组。中途断流的流会产生带内
-`error` SSE 事件（此时 HTTP header 已提交）。
+累积，交错到达的并行 tool call 也能正确重组。
+
+失败怎么上报，取决于响应已提交到哪一步：
+
+- **首帧即被拒绝**：网关对拒绝的回应是 `200` + 一个错误帧，且该帧就是流的
+  **第一帧**。此时还没有任何内容发给客户端，所以这一帧会在提交响应之前先被
+  读取，改用 HTTP 状态码回给客户端 —— 权限拒绝 `403`、限流/额度措辞 `429`、
+  其余 `502`。单发一个带内 `error` 事件对「只看状态码和终局事件」的客户端是
+  不可见的（Codex CLI 会重试 5 次然后把这一轮丢掉），状态码则可见。等待首帧
+  最多 `peekFirstFrameTimeout`（2 秒），因此卡死的上游仍会把 header 交给客户端，
+  由客户端自己的超时接管。
+- **已经出过内容后失败**：保留带内 `error` 事件，**并**用 `response.completed`
+  收尾这一轮，客户端已经收到的内容不会丢。
+- **一个字节都没出就失败**：只发 `error` 事件 —— 给这种回合补终局完成，等于
+  宣称模型答了话而它并没有。
 
 ### Header 处理
 

@@ -54,9 +54,18 @@ func TestNormalizeModelQuirks(t *testing.T) {
 			},
 		},
 		{
-			name:  "chat: user effort is overridden by the tools rule",
+			// The client's effort survives a tool turn: the passthrough route
+			// shares the converter's capability table, which stopped forcing
+			// "none" for luna (re-measured 2026-10-13).
+			name:      "chat: tools no longer override the user effort",
+			path:      chatPath,
+			body:      `{"model":"gpt-6-luna","messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"reasoning_effort":"high"}`,
+			unchanged: true,
+		},
+		{
+			name:  "chat: an effort outside the model's set falls back on a tool turn",
 			path:  chatPath,
-			body:  `{"model":"gpt-6-luna","messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"reasoning_effort":"high"}`,
+			body:  `{"model":"gpt-6-luna","messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"reasoning_effort":"max"}`,
 			rules: []string{ruleReasoningEffort},
 			check: func(t *testing.T, doc map[string]json.RawMessage) {
 				wantRaw(t, doc, "reasoning_effort", `"none"`)

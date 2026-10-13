@@ -76,12 +76,15 @@ func ConvertResponse(chat *completions.Response, req *responses.Request) *respon
 		})
 	}
 
+	namespaces := namespaceIndex(req.Tools)
 	for _, tc := range choice.Message.ToolCalls {
+		name, namespace := resolveCallName(namespaces, tc.Function.Name)
 		out.Output = append(out.Output, responses.Item{
 			Type:      "function_call",
 			ID:        "fc_" + chat.ID,
 			CallID:    tc.ID,
-			Name:      tc.Function.Name,
+			Name:      name,
+			Namespace: namespace,
 			Arguments: &tc.Function.Arguments,
 			Status:    "completed",
 		})

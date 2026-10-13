@@ -107,6 +107,10 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 		input = req.Prompt
 	}
 
+	// Replayed calls name their tool the way the client stores it; the model
+	// only knows the flattened spelling (see namespace.go).
+	namespaces := namespaceIndex(req.Tools)
+
 	var msgs []completions.Message
 
 	hasSystem := false
@@ -142,7 +146,7 @@ func convertMessages(req *responses.Request) ([]completions.Message, error) {
 					ID:   orEmpty(item.CallID, item.ID),
 					Type: "function",
 					Function: completions.FuncCall{
-						Name:      item.Name,
+						Name:      historyCallName(namespaces, item),
 						Arguments: arguments,
 					},
 				}
@@ -268,26 +272,41 @@ func toolOutputContent(out *responses.OutputContent) completions.MessageContent 
 }
 
 // convertTools maps flattened Responses tool definitions to the nested chat
-// completions shape. Non-function tool types are dropped: chat completions
-// has no representation for them.
+// completions shape.
+//
+// A "namespace" wrapper has no chat equivalent, but its members do: they are
+// flattened under their qualified name so the model can call them at all (see
+// namespace.go for the round trip). Built-in tool types with no function shape
+// (web_search, image_generation, …) are still dropped — chat completions has
+// no representation for them.
 func convertTools(tools []responses.Tool) []completions.Tool {
 	if len(tools) == 0 {
 		return nil
 	}
 	out := make([]completions.Tool, 0, len(tools))
-	for _, t := range tools {
-		if t.Type != "" && t.Type != "function" {
-			continue
-		}
+	add := func(name, description string, params json.RawMessage, strict *bool) {
 		out = append(out, completions.Tool{
 			Type: "function",
 			Function: completions.Function{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  withObjectType(t.Parameters),
-				Strict:      t.Strict,
+				Name:        name,
+				Description: description,
+				Parameters:  withObjectType(params),
+				Strict:      strict,
 			},
 		})
+	}
+	for _, t := range tools {
+		switch t.Type {
+		case "", "function":
+			add(t.Name, t.Description, t.Parameters, t.Strict)
+		case "namespace":
+			for _, nt := range t.Tools {
+				if nt.Type != "" && nt.Type != "function" {
+					continue
+				}
+				add(flatToolName(t.Name, nt.Name), nt.Description, nt.Parameters, nt.Strict)
+			}
+		}
 	}
 	if len(out) == 0 {
 		return nil
