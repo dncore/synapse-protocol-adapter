@@ -623,6 +623,10 @@ func TestInBandRejectionStatus(t *testing.T) {
 		{"permission wording", completions.ErrorBody{Type: "api_error", Message: "permission denied"}, http.StatusForbidden},
 		{"rate limit", completions.ErrorBody{Type: "api_error", Message: "Too many requests in recent 10 seconds. Maximum allowed: 20"}, http.StatusTooManyRequests},
 		{"quota", completions.ErrorBody{Type: "api_error", Message: "quota exhausted"}, http.StatusTooManyRequests},
+		// The gateway's real spent-budget frame carries BOTH signals (measured
+		// 2026-10-15): type=forbidden plus quota wording. Quota must win, or a
+		// monthly budget that resets reads to clients as a permanent refusal.
+		{"quota framed as forbidden", completions.ErrorBody{Type: "forbidden", Message: "Monthly quota exceeded", Code: "forbidden"}, http.StatusTooManyRequests},
 		// A bare "limit" must not become a retriable 429: this one is fatal.
 		{"context limit stays an upstream error", completions.ErrorBody{Type: "api_error", Message: "context length limit exceeded"}, http.StatusBadGateway},
 		{"generic", completions.ErrorBody{Type: "api_error", Message: "Provider returned 400"}, http.StatusBadGateway},

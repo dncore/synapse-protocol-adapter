@@ -767,15 +767,22 @@ func (s *Server) writeConvertedResponse(w http.ResponseWriter, chat *completions
 // permission refusal as "forbidden" and a spent budget with rate/quota wording.
 // Matching stays on explicit phrases rather than bare "limit" so that a fatal
 // "context length limit exceeded" is not turned into a retriable 429.
+//
+// Quota wording is tested BEFORE the permission words, because the gateway does
+// not keep the two signals apart: a spent monthly budget arrives as
+// {"type":"forbidden","message":"Monthly quota exceeded"} (measured 2026-10-15).
+// Matching "forbidden" first would call that a permission refusal, and clients
+// treat 403 as permanent — Codex retries it five times and then drops the turn —
+// when the real verdict is "budget spent, comes back next month", which is 429.
 func inBandRejectionStatus(err *completions.ErrorBody) int {
 	hay := strings.ToLower(err.Type + " " + err.Code + " " + err.Message)
 	switch {
-	case strings.Contains(hay, "forbidden"), strings.Contains(hay, "permission"),
-		strings.Contains(hay, "unauthorized"), strings.Contains(hay, "access denied"):
-		return http.StatusForbidden
 	case strings.Contains(hay, "too many requests"), strings.Contains(hay, "rate limit"),
 		strings.Contains(hay, "rate_limit"), strings.Contains(hay, "quota"):
 		return http.StatusTooManyRequests
+	case strings.Contains(hay, "forbidden"), strings.Contains(hay, "permission"),
+		strings.Contains(hay, "unauthorized"), strings.Contains(hay, "access denied"):
+		return http.StatusForbidden
 	default:
 		return http.StatusBadGateway
 	}

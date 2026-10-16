@@ -373,9 +373,11 @@ committed:
 - **Rejected by the opening frame.** The gateway answers a rejection with
   `200` plus an error frame as the stream's *first* frame. Nothing has reached
   the client yet, so the frame is read before the response is committed and
-  the client gets an HTTP status instead — `403` for a permission refusal,
-  `429` for rate/quota wording, `502` otherwise. An in-band `error` event
-  alone is invisible to clients that key on the status and the terminal event
+  the client gets an HTTP status instead — `429` for rate/quota wording
+  (matched *first*, since the gateway also labels a spent monthly budget
+  `type:"forbidden"`), `403` for any other permission refusal, `502` otherwise.
+  An in-band `error` event alone is invisible to clients that key on the status
+  and the terminal event
   (Codex CLI retries five times and then drops the turn), whereas a status is
   not. The frame is awaited for at most `peekFirstFrameTimeout` (2s) so a
   stalled upstream still hands the client its headers and leaves the client's
