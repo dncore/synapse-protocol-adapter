@@ -122,6 +122,21 @@ type Passthrough struct {
 	//   "id"      display_name = the model id
 	//   "id-desc" display_name = "<id> — <original description>"
 	ModelsDisplayName string `yaml:"models_display_name"`
+
+	// ModelAliases maps a client-facing model id to the upstream id the proxy
+	// actually sends. A request naming an alias is rewritten before anything
+	// else reads the model — quirks, fallback substitution and takeover all
+	// see the resolved id — and the alias is advertised in GET .../models so
+	// a client can discover and select it.
+	//
+	// Keys should be Anthropic-shaped (claude-, sonnet-, opus-, haiku-):
+	// Claude Desktop drops a configured model whose name carries none of
+	// those markers, so a tier pointed at a non-Anthropic model has to be
+	// addressed through an alias rather than by its real id.
+	//
+	// Resolution is one hop. A value that is itself a key is rejected, and an
+	// id that is not a key is forwarded untouched.
+	ModelAliases map[string]string `yaml:"model_aliases"`
 }
 
 // Server is the listener configuration.
@@ -595,6 +610,9 @@ func Validate(cfg *Config) error {
 	if cfg.Passthrough.MaxRewriteBytes <= 0 {
 		errs = append(errs, errors.New("passthrough.max_rewrite_bytes must be > 0 (e.g. 8388608)"))
 	}
+	if err := validateModelAliases(cfg); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.Timeouts.Connect <= 0 {
 		errs = append(errs, errors.New("timeouts.connect must be > 0 (e.g. 10s)"))
 	}
@@ -625,6 +643,32 @@ func Validate(cfg *Config) error {
 }
 
 // validateUpstreamRetry checks the 429-absorption section, enabled or not.
+// validateModelAliases rejects an alias table that cannot be resolved in one
+// hop: an empty side, a self-map, or a value that is itself a key (which would
+// make the result depend on traversal order or close a cycle).
+func validateModelAliases(cfg *Config) error {
+	if len(cfg.Passthrough.ModelAliases) == 0 {
+		return nil
+	}
+	keys := make(map[string]bool, len(cfg.Passthrough.ModelAliases))
+	for from := range cfg.Passthrough.ModelAliases {
+		keys[strings.TrimSpace(from)] = true
+	}
+	var errs []error
+	for from, to := range cfg.Passthrough.ModelAliases {
+		f, t := strings.TrimSpace(from), strings.TrimSpace(to)
+		switch {
+		case f == "" || t == "":
+			errs = append(errs, fmt.Errorf("passthrough.model_aliases: %q → %q has an empty side", from, to))
+		case f == t:
+			errs = append(errs, fmt.Errorf("passthrough.model_aliases: %q maps to itself", from))
+		case keys[t]:
+			errs = append(errs, fmt.Errorf("passthrough.model_aliases: %q → %q points at another alias; resolution is one hop", from, t))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func validateUpstreamRetry(cfg *Config) error {
 	var errs []error
 	r := cfg.UpstreamRetry

@@ -397,6 +397,7 @@ YAML 文件 + 环境变量覆盖。**配置中刻意不含任何凭据。**
 | `upstream.anthropic_mode` | `passthrough` | `PROXY_UPSTREAM_ANTHROPIC_MODE` | `passthrough` 把 Anthropic 挂载原样转发给上游；`gpt6-tools` 额外把上游翻译器服务不了的请求（gpt-6 + 工具）在本地翻译，其余回退透传 |
 | `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | 在透明路由上改写「模型族自身 API 改名/拒收字段」的请求体（目前是 `gpt-6`）；关闭时这些路由绝不改动客户端字节 |
 | `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | `model_quirks` 会改写的请求体上限；更大的请求原样转发 |
+| `passthrough.model_aliases` | `{}` | — | 客户端可见的模型 id → 代理实际转发的上游 id。只重写请求里的 `model` 成员，未列出的 id 原样透传，每个键同时作为一行广告在 `GET .../models` 里。只解析一跳：值不能再是另一个键。Claude Desktop 会丢弃名称里不含 Anthropic 标记的已配置模型，因此「把某个档位指向非 Anthropic 模型」要靠 Anthropic 形状的别名 |
 | `passthrough.models_display_name` | `""` | `PROXY_PASSTHROUGH_MODELS_DISPLAY_NAME` | 改写 `GET .../models` 响应里的 `display_name`：`""` 不改，`id` 设为模型 id，`id-desc` 设为 `"<id> — <原描述>"`。用于上游把描述写进该字段、从不写 id 的情况——这类上游会让渲染 `display_name` 的客户端只显示描述 |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | 到 upstream 的 TCP/TLS 连接超时 |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | 单请求总时长上限（长生成） |

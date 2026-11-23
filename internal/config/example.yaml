@@ -174,6 +174,26 @@ passthrough:
   # max_rewrite_bytes, or in a shape this does not recognise, stream through
   # unchanged.
   models_display_name: ""
+  #
+  # model_aliases maps a client-facing model id to the upstream id the proxy
+  # actually sends. An id that is not a key is forwarded untouched.
+  #
+  # Why it is needed: Claude Desktop discards a configured model whose name
+  # carries none of claude/sonnet/opus/haiku/anthropic, and it has no alias
+  # table of its own — the id it sends is the id it was given. So a tier that
+  # should point at a non-Anthropic model has to be named with an
+  # Anthropic-shaped alias and resolved here.
+  #
+  # Every key is also advertised as a row in GET .../models, which is what
+  # makes the alias discoverable and lets it survive a client-side check
+  # against the catalogue. Resolution is one hop: a value may not itself be a
+  # key, and an empty or self-mapping entry is a startup error.
+  #
+  # model_aliases:
+  #   claude-sonnet-4-5: deepseek-v4.1-flash
+  #   claude-opus-4-5: kimi-k3.1-pro
+  #   claude-haiku-4-5: glm-5.3-flash
+  model_aliases: {}
 
 timeouts:
   connect: 10s        # TCP/TLS connect to upstream

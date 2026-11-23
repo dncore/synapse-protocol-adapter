@@ -61,6 +61,19 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		s.metrics.ErrorsTotal.With("client_canceled").Inc()
 		return // client aborted while sending its body
 	}
+	// An alias is resolved before anything downstream reads the model: the
+	// quirk rewriter, the unavailable-model fallback and the Anthropic
+	// takeover all key on the real upstream id, not the client-facing one.
+	if buffered != nil && len(s.cfg.Passthrough.ModelAliases) > 0 &&
+		int64(len(buffered)) <= s.cfg.Passthrough.MaxRewriteBytes {
+		if rewritten, from, to, hit := rewriteModelAliases(buffered, s.cfg.Passthrough.ModelAliases); hit {
+			s.metrics.PassthroughRewritesTotal.With("model-alias").Inc()
+			s.logger.Info("model alias resolved",
+				"request_id", middleware.RequestIDOf(r), "from", from, "to", to)
+			buffered = rewritten
+		}
+	}
+
 	// The rewrite budget is a hard cap on what the rewriter touches, even
 	// when the retry buffer happened to hold a larger body.
 	if buffered != nil && s.cfg.Passthrough.ModelQuirks && int64(len(buffered)) <= s.cfg.Passthrough.MaxRewriteBytes {
@@ -185,11 +198,12 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A model catalogue is the only response body this route rewrites, and
-	// only when asked to: see Passthrough.ModelsDisplayName.
-	if s.cfg.Passthrough.ModelsDisplayName != "" &&
+	// only when asked to: see Passthrough.ModelsDisplayName and
+	// Passthrough.ModelAliases.
+	if (s.cfg.Passthrough.ModelsDisplayName != "" || len(s.cfg.Passthrough.ModelAliases) > 0) &&
 		r.Method == http.MethodGet && isModelsPath(r.URL.Path) &&
 		resp.StatusCode == http.StatusOK &&
-		s.rewriteModelsResponse(w, resp, s.cfg.Passthrough.ModelsDisplayName) {
+		s.rewriteModelsResponse(w, resp, s.cfg.Passthrough.ModelsDisplayName, s.cfg.Passthrough.ModelAliases) {
 		return
 	}
 
@@ -310,6 +324,11 @@ func (s *Server) bufferRequestBody(r *http.Request) ([]byte, error) {
 	if s.cfg.Passthrough.ModelQuirks && rewriteEligible(r) && s.cfg.Passthrough.MaxRewriteBytes > limit {
 		limit = s.cfg.Passthrough.MaxRewriteBytes
 	}
+	// Alias resolution reads the model member, so the body has to be held
+	// even when the quirk rewriter is off.
+	if len(s.cfg.Passthrough.ModelAliases) > 0 && aliasEligible(r) && s.cfg.Passthrough.MaxRewriteBytes > limit {
+		limit = s.cfg.Passthrough.MaxRewriteBytes
+	}
 	// The Anthropic takeover needs the decoded body to decide, so eligible
 	// requests are buffered up to the same ceiling the converted route uses.
 	if s.anthropicTakeoverEligible(r) && int64(s.cfg.Limits.MaxBodyBytes) > limit {
@@ -349,6 +368,20 @@ func rewriteEligible(r *http.Request) bool {
 		return strings.HasSuffix(p, "/messages")
 	}
 	return strings.HasSuffix(p, "/chat/completions")
+}
+
+// aliasEligible reports whether a request can name a model at all. It is
+// deliberately wider than rewriteEligible: alias resolution applies to every
+// route that carries a model, not only the two the quirk rewriter touches.
+func aliasEligible(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	p := strings.TrimSuffix(r.URL.Path, "/")
+	return strings.HasSuffix(p, "/messages") ||
+		strings.HasSuffix(p, "/chat/completions") ||
+		strings.HasSuffix(p, "/complete") ||
+		strings.HasSuffix(p, "/responses")
 }
 
 // countingReader streams through while tallying bytes into a counter.

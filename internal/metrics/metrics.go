@@ -70,7 +70,7 @@ func NewRegistry() *Registry {
 		Upstream429Total:         &LabeledCounter{Name: "protocol_proxy_upstream_429_total", Help: "HTTP 429 responses received from the upstream, by route.", Label: "route"},
 		RetriesAbsorbedTotal:     &Counter{Name: "protocol_proxy_429_absorbed_total", Help: "Upstream 429s absorbed by a retry (each retry issued)."},
 		RetryExhaustedTotal:      &Counter{Name: "protocol_proxy_429_exhausted_total", Help: "Requests that gave up waiting after their retry budget was exhausted."},
-		PassthroughRewritesTotal: &LabeledCounter{Name: "protocol_proxy_passthrough_rewrites_total", Help: "Passthrough request bodies rewritten by the model-quirk normalizer, by rule.", Label: "rule"},
+		PassthroughRewritesTotal: &LabeledCounter{Name: "protocol_proxy_passthrough_rewrites_total", Help: "Passthrough request bodies rewritten, by rule (model quirks and model-alias resolution).", Label: "rule"},
 		AnthropicTakeoverTotal:   &Counter{Name: "protocol_proxy_anthropic_takeover_total", Help: "Anthropic-mount requests elected for local translation (upstream.anthropic_mode=gpt6-tools); see the fallback counter for candidates that were handed back."},
 		AnthropicFallbackTotal:   &LabeledCounter{Name: "protocol_proxy_anthropic_fallback_total", Help: "Anthropic-mount takeover candidates handed back to passthrough, by reason.", Label: "reason"},
 		ModelUnavailableTotal:    &LabeledCounter{Name: "protocol_proxy_model_unavailable_total", Help: "Requests served while the model was marked unavailable after repeated channel-rotation failures (single attempt, no retry budget); excludes emulated and fallback-substituted requests, which have their own counters.", Label: "served_by"},

@@ -434,3 +434,34 @@ func TestAnthropicModeDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("unknown mode must be rejected, got %v", err)
 	}
 }
+
+func TestValidate_ModelAliases(t *testing.T) {
+	cfg := Defaults()
+	cfg.Passthrough.ModelAliases = map[string]string{
+		"claude-sonnet-4-5": "deepseek-v4.1-flash",
+		"claude-haiku-4-5":  "glm-5.3-flash",
+	}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("a one-hop table must validate: %v", err)
+	}
+
+	cfg.Passthrough.ModelAliases = map[string]string{"claude-sonnet-4-5": "claude-sonnet-4-5"}
+	if err := Validate(&cfg); err == nil || !strings.Contains(err.Error(), "maps to itself") {
+		t.Fatalf("self-map must be rejected, got %v", err)
+	}
+
+	// A → B → C would need two hops, and B → A would close a cycle; both are
+	// rejected the same way.
+	cfg.Passthrough.ModelAliases = map[string]string{
+		"claude-sonnet-4-5": "claude-opus-4-5",
+		"claude-opus-4-5":   "deepseek-v4.1-flash",
+	}
+	if err := Validate(&cfg); err == nil || !strings.Contains(err.Error(), "one hop") {
+		t.Fatalf("chained aliases must be rejected, got %v", err)
+	}
+
+	cfg.Passthrough.ModelAliases = map[string]string{"claude-sonnet-4-5": "  "}
+	if err := Validate(&cfg); err == nil || !strings.Contains(err.Error(), "empty side") {
+		t.Fatalf("empty target must be rejected, got %v", err)
+	}
+}
