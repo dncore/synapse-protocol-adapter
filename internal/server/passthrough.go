@@ -184,6 +184,15 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A model catalogue is the only response body this route rewrites, and
+	// only when asked to: see Passthrough.ModelsDisplayName.
+	if s.cfg.Passthrough.ModelsDisplayName != "" &&
+		r.Method == http.MethodGet && isModelsPath(r.URL.Path) &&
+		resp.StatusCode == http.StatusOK &&
+		s.rewriteModelsResponse(w, resp, s.cfg.Passthrough.ModelsDisplayName) {
+		return
+	}
+
 	upstream.ForwardResponseHeaders(w.Header(), resp.Header)
 	if resp.Uncompressed {
 		// Go transparently decoded the body; forwarding the encoding header

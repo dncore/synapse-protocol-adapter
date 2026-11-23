@@ -111,6 +111,17 @@ type Passthrough struct {
 	// requests are forwarded unrewritten (the retry buffer may still hold
 	// them, that only affects retries). Default 8 MiB.
 	MaxRewriteBytes int64 `yaml:"max_rewrite_bytes"`
+
+	// ModelsDisplayName rewrites display_name in a models response, for
+	// gateways whose catalogue puts a human description in that field and
+	// omits the model id from it. Clients that render display_name — Claude
+	// Desktop among them — then show descriptions and no identifier.
+	// This is the one response body the transparent routes will rewrite.
+	//
+	//   ""        leave the response untouched (default)
+	//   "id"      display_name = the model id
+	//   "id-desc" display_name = "<id> — <original description>"
+	ModelsDisplayName string `yaml:"models_display_name"`
 }
 
 // Server is the listener configuration.
@@ -487,6 +498,9 @@ func applyEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Passthrough.MaxRewriteBytes = int64(n)
 		}
+	}
+	if v := os.Getenv("PROXY_PASSTHROUGH_MODELS_DISPLAY_NAME"); v != "" {
+		cfg.Passthrough.ModelsDisplayName = v
 	}
 	if v := os.Getenv("PROXY_TIMEOUTS_CONNECT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {

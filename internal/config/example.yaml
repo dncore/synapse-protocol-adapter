@@ -162,6 +162,18 @@ passthrough:
   # Off by default: leave it off unless the upstream needs the fixups.
   model_quirks: false
   max_rewrite_bytes: 8388608  # 8 MiB: bounds the buffered rewrite path
+  #
+  # models_display_name rewrites display_name in a GET .../models response.
+  # Some gateways fill that field with a human description and never mention
+  # the model id, so a client that renders display_name (Claude Desktop, for
+  # one) shows a list of descriptions you cannot tell apart.
+  #   ""        leave the response untouched (default)
+  #   id        display_name = model id
+  #   id-desc   display_name = "<id> — <original description>"
+  # Every other response stays byte-for-byte. Catalogues larger than
+  # max_rewrite_bytes, or in a shape this does not recognise, stream through
+  # unchanged.
+  models_display_name: ""
 
 timeouts:
   connect: 10s        # TCP/TLS connect to upstream

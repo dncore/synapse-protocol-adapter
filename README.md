@@ -431,6 +431,7 @@ credentials by design.** See [`config.example.yaml`](config.example.yaml).
 | `upstream.anthropic_mode` | `passthrough` | `PROXY_UPSTREAM_ANTHROPIC_MODE` | `passthrough` forwards the Anthropic mount to the upstream; `gpt6-tools` additionally translates the requests the upstream translator cannot serve (gpt-6 + tools) locally, falling back for anything else |
 | `passthrough.model_quirks` | `false` | `PROXY_PASSTHROUGH_MODEL_QUIRKS` | Rewrite request bodies on the transparent routes for the model families whose API renamed or refuses a field the client sends (currently `gpt-6`); off means the routes never touch the client's bytes |
 | `passthrough.max_rewrite_bytes` | `8388608` | `PROXY_PASSTHROUGH_MAX_REWRITE_BYTES` | Largest body `model_quirks` will rewrite; larger requests are forwarded unchanged |
+| `passthrough.models_display_name` | `""` | `PROXY_PASSTHROUGH_MODELS_DISPLAY_NAME` | Rewrite `display_name` in a `GET .../models` response: `""` leaves it alone, `id` sets it to the model id, `id-desc` sets `"<id> — <original>"`. For gateways whose catalogue puts a description there and never the id, which leaves clients that render `display_name` showing descriptions only |
 | `timeouts.connect` | `10s` | `PROXY_TIMEOUTS_CONNECT` | TCP/TLS connect to upstream |
 | `timeouts.request` | `30m` | `PROXY_TIMEOUTS_REQUEST` | Total per-request ceiling (long generations) |
 | `timeouts.idle` | `5m` | `PROXY_TIMEOUTS_IDLE` | Idle keep-alive connections |
